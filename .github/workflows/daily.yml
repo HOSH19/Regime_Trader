@@ -1,0 +1,63 @@
+# Daily run: Mon–Fri after US cash close (21:05 UTC ≈ 4:05 PM ET in standard time).
+# If your machine is off, GitHub’s runners still execute this on schedule.
+#
+# Monorepo: if the repo root is the parent folder (e.g. trading/) containing regime-trader/,
+# add defaults.run.working-directory: regime-trader to the job and prefix paths below with regime-trader/
+
+name: Daily regime trader
+
+on:
+  schedule:
+    - cron: "5 21 * * 1-5"
+  workflow_dispatch:
+
+concurrency:
+  group: regime-trader-daily
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    env:
+      ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+      ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      NEWSAPI_KEY: ${{ secrets.NEWSAPI_KEY }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Restore HMM + portfolio state
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            hmm_model.pkl
+            state_snapshot.json
+          key: regime-${{ runner.os }}-${{ hashFiles('config/settings.yaml') }}
+          restore-keys: |
+            regime-${{ runner.os }}-
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run daily pipeline
+        run: python run_daily.py
+
+      - name: Save HMM + portfolio state
+        if: always()
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            hmm_model.pkl
+            state_snapshot.json
+          key: regime-${{ runner.os }}-${{ hashFiles('config/settings.yaml') }}
