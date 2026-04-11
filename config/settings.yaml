@@ -1,0 +1,59 @@
+broker:
+  paper_trading: true
+  symbols: [AAPL, TSLA, GOOGL, NVDA, AMD]
+  timeframe: 1Day
+
+hmm:
+  n_candidates: [3, 4, 5, 6, 7]
+  n_init: 10
+  covariance_type: full
+  min_train_bars: 504        # 2 years of daily bars
+  stability_bars: 3          # bars a new regime must persist before confirmed
+  flicker_window: 20         # bars over which flicker rate is measured
+  flicker_threshold: 4       # max regime changes per flicker_window
+  min_confidence: 0.55       # minimum probability to act on regime
+
+strategy:
+  low_vol_allocation: 0.95
+  mid_vol_allocation_trend: 0.95
+  mid_vol_allocation_no_trend: 0.60
+  high_vol_allocation: 0.60
+  low_vol_leverage: 1.25
+  rebalance_threshold: 0.10  # only rebalance when allocation drifts >10%
+  uncertainty_size_mult: 0.50
+
+risk:
+  max_risk_per_trade: 0.01       # 1% of portfolio per trade
+  max_exposure: 0.80             # max total portfolio exposure
+  max_leverage: 1.25
+  max_single_position: 0.15      # max 15% in one symbol
+  max_correlated_exposure: 0.30  # max 30% in correlated group
+  max_concurrent: 5
+  max_daily_trades: 20
+  daily_dd_reduce: 0.02          # reduce 50% at 2% daily DD
+  daily_dd_halt: 0.03            # close all + halt at 3%
+  weekly_dd_reduce: 0.05
+  weekly_dd_halt: 0.07
+  max_dd_from_peak: 0.10         # halt + lock file at 10% from peak
+  correlation_reduce_threshold: 0.70
+  correlation_reject_threshold: 0.85
+  duplicate_block_seconds: 60
+  spread_max_pct: 0.005          # reject if spread > 0.5%
+  gap_risk_multiplier: 3.0       # assume 3x gap-through for overnight sizing
+  min_position_dollars: 100.0
+
+backtest:
+  slippage_pct: 0.0005
+  initial_capital: 100000
+  train_window: 252
+  test_window: 126
+  step_size: 126
+  risk_free_rate: 0.045
+  fill_delay_bars: 1             # signal at bar N, fill at bar N+1
+
+monitoring:
+  dashboard_refresh_seconds: 5
+  alert_rate_limit_minutes: 15
+  log_dir: logs
+  log_max_bytes: 10485760        # 10 MB
+  log_backup_count: 30

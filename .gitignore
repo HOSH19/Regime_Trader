@@ -1,0 +1,16 @@
+.env
+config/credentials.yaml
+*.pyc
+__pycache__/
+*.pkl
+*.pickle
+logs/
+state_snapshot.json
+trading_halted.lock
+.DS_Store
+*.csv
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
