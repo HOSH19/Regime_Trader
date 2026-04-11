@@ -146,8 +146,8 @@ class MarketData:
         from alpaca.data.live import StockDataStream
         import os
 
-        api_key = os.getenv("ALPACA_API_KEY")
-        secret_key = os.getenv("ALPACA_SECRET_KEY")
+        api_key = (os.getenv("ALPACA_API_KEY") or "").strip()
+        secret_key = (os.getenv("ALPACA_SECRET_KEY") or "").strip()
 
         stream = StockDataStream(api_key, secret_key)
 

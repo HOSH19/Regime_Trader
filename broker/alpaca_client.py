@@ -33,6 +33,11 @@ class AlpacaClient:
 
         api_key = os.getenv("ALPACA_API_KEY") or self.cfg.get("alpaca", {}).get("api_key")
         secret_key = os.getenv("ALPACA_SECRET_KEY") or self.cfg.get("alpaca", {}).get("secret_key")
+        # GitHub / .env pastes often include a trailing newline, which breaks HTTP headers.
+        if api_key:
+            api_key = str(api_key).strip()
+        if secret_key:
+            secret_key = str(secret_key).strip()
 
         if not api_key or not secret_key:
             raise ValueError(
