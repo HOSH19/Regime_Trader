@@ -1,8 +1,4 @@
 # Daily run: Mon–Fri after US cash close (21:05 UTC ≈ 4:05 PM ET in standard time).
-#
-# Repository secrets: Settings → Secrets and variables → Actions → Repository secrets
-# Environment secrets: Settings → Environments → <name> → Environment secrets — set `environment:` below to <name>
-
 name: Daily regime trader
 
 on:
@@ -18,8 +14,6 @@ jobs:
   run:
     runs-on: ubuntu-latest
     timeout-minutes: 45
-    # Must match the environment name where your secrets live (Settings → Environments).
-    # If secrets are under "Repository secrets" only, you can remove this line.
     environment: traderbot
 
     env:
