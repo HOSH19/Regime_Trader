@@ -206,8 +206,8 @@ def run_trading_loop(config: dict, dry_run: bool = False):
     from broker.alpaca_client import AlpacaClient
     from broker.order_executor import OrderExecutor
     from broker.position_tracker import PositionTracker
-from core.strategies import StrategyOrchestrator
-from core.risk import PortfolioState, RiskManager
+    from core.strategies import StrategyOrchestrator
+    from core.risk import PortfolioState, RiskManager
     from core.signal_generator import SignalGenerator
     from data.market_data import MarketData
     from monitoring.alerts import AlertManager
