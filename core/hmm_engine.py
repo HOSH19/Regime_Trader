@@ -333,56 +333,83 @@ class HMMEngine:
     ) -> RegimeState:
         """Require stability_bars consecutive signals before confirming a regime change."""
         stability_bars = self.config.get("stability_bars", 3)
-        confirmed = False
-
         if self._current_state is None:
-            self._current_state = self._regime_state(
-                raw_state_id, probability, state_probs,
-                is_confirmed=True, consecutive_bars=1,
-            )
-            self._consecutive_bars = 1
-            return self._current_state
+            return self._stability_bootstrap(raw_state_id, probability, state_probs)
 
-        current_id = self._current_state.state_id
+        if raw_state_id == self._current_state.state_id:
+            return self._stability_hold_current(probability, state_probs)
 
-        if raw_state_id == current_id:
-            self._pending_regime_id = None
-            self._pending_bars = 0
-            self._consecutive_bars += 1
-            confirmed = True
-        else:
-            if self._pending_regime_id == raw_state_id:
-                self._pending_bars += 1
-            else:
-                self._pending_regime_id = raw_state_id
-                self._pending_bars = 1
+        switched = self._stability_try_confirm_switch(
+            raw_state_id, probability, state_probs, stability_bars
+        )
+        if switched is not None:
+            return switched
 
-            if self._pending_bars >= stability_bars:
-                self._flicker_history.append(1)
-                self._current_state = self._regime_state(
-                    raw_state_id, probability, state_probs,
-                    is_confirmed=True, consecutive_bars=self._pending_bars,
-                )
-                self._consecutive_bars = self._pending_bars
-                self._pending_regime_id = None
-                self._pending_bars = 0
-                logger.warning(
-                    f"Regime confirmed: {self._current_state.label} (p={probability:.3f})"
-                )
-                return self._current_state
-
-            self._flicker_history.append(0)
-
-        window = self.config.get("flicker_window", 20)
-        self._flicker_history = self._flicker_history[-window:]
-
+        self._flicker_history.append(0)
+        self._trim_flicker_window()
         return self._regime_state(
             self._current_state.state_id,
             probability,
             state_probs,
-            is_confirmed=confirmed,
+            is_confirmed=False,
             consecutive_bars=self._consecutive_bars,
         )
+
+    def _stability_bootstrap(
+        self, raw_state_id: int, probability: float, state_probs: np.ndarray
+    ) -> RegimeState:
+        self._current_state = self._regime_state(
+            raw_state_id, probability, state_probs,
+            is_confirmed=True, consecutive_bars=1,
+        )
+        self._consecutive_bars = 1
+        return self._current_state
+
+    def _stability_hold_current(self, probability: float, state_probs: np.ndarray) -> RegimeState:
+        self._pending_regime_id = None
+        self._pending_bars = 0
+        self._consecutive_bars += 1
+        self._trim_flicker_window()
+        return self._regime_state(
+            self._current_state.state_id,
+            probability,
+            state_probs,
+            is_confirmed=True,
+            consecutive_bars=self._consecutive_bars,
+        )
+
+    def _stability_try_confirm_switch(
+        self,
+        raw_state_id: int,
+        probability: float,
+        state_probs: np.ndarray,
+        stability_bars: int,
+    ) -> Optional[RegimeState]:
+        if self._pending_regime_id == raw_state_id:
+            self._pending_bars += 1
+        else:
+            self._pending_regime_id = raw_state_id
+            self._pending_bars = 1
+
+        if self._pending_bars < stability_bars:
+            return None
+
+        self._flicker_history.append(1)
+        self._current_state = self._regime_state(
+            raw_state_id, probability, state_probs,
+            is_confirmed=True, consecutive_bars=self._pending_bars,
+        )
+        self._consecutive_bars = self._pending_bars
+        self._pending_regime_id = None
+        self._pending_bars = 0
+        logger.warning(
+            "Regime confirmed: %s (p=%.3f)", self._current_state.label, probability
+        )
+        return self._current_state
+
+    def _trim_flicker_window(self) -> None:
+        window = self.config.get("flicker_window", 20)
+        self._flicker_history = self._flicker_history[-window:]
 
     def get_regime_stability(self) -> int:
         """Consecutive bars in current confirmed regime."""

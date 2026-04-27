@@ -118,6 +118,39 @@ def load_state_snapshot() -> dict:
     return {}
 
 
+def _bar_symbol(bar, symbols: list) -> str:
+    return bar.symbol if hasattr(bar, "symbol") else symbols[0]
+
+
+def _append_stream_bar(bar, sym: str, bars_by_symbol: dict) -> bool:
+    """Append one bar to history; return False if symbol is not tracked."""
+    if sym not in bars_by_symbol:
+        return False
+    new_row = {
+        "open": bar.open, "high": bar.high,
+        "low": bar.low, "close": bar.close, "volume": bar.volume,
+    }
+    new_df = pd.DataFrame([new_row], index=[bar.timestamp])
+    bars_by_symbol[sym] = pd.concat([bars_by_symbol[sym], new_df])
+    return True
+
+
+def _allocation_fractions(portfolio) -> dict:
+    if portfolio.equity <= 0:
+        return {}
+    return {
+        s: p.shares * p.current_price / portfolio.equity
+        for s, p in portfolio.positions.items()
+    }
+
+
+def _sync_position_mark_prices(portfolio, bars_by_symbol: dict, position_tracker):
+    for sym, _pos in portfolio.positions.items():
+        hist = bars_by_symbol.get(sym)
+        if hist is not None and len(hist) > 0:
+            position_tracker.update_position_price(sym, float(hist["close"].iloc[-1]))
+
+
 def _preload_historical_bars(market_data, symbols: list, timeframe: str) -> dict:
     """Fetch long history per symbol for HMM/signal context; skip empty series."""
     out = {}
@@ -174,7 +207,6 @@ def run_trading_loop(config: dict, dry_run: bool = False):
     from broker.alpaca_client import AlpacaClient
     from broker.order_executor import OrderExecutor
     from broker.position_tracker import PositionTracker
-    from core.hmm_engine import HMMEngine
     from core.regime_strategies import StrategyOrchestrator
     from core.risk_manager import PortfolioState, RiskManager
     from core.signal_generator import SignalGenerator
@@ -216,29 +248,16 @@ def run_trading_loop(config: dict, dry_run: bool = False):
     def on_bar(bar):
         """Process an incoming real-time bar: update history, detect regime, validate signals, and place orders."""
         nonlocal last_regime_state
-        sym = bar.symbol if hasattr(bar, "symbol") else list(bars_by_symbol.keys())[0]
-
-        if sym in bars_by_symbol:
-            new_row = {
-                "open": bar.open, "high": bar.high,
-                "low": bar.low, "close": bar.close, "volume": bar.volume,
-            }
-            new_df = pd.DataFrame([new_row], index=[bar.timestamp])
-            bars_by_symbol[sym] = pd.concat([bars_by_symbol[sym], new_df])
-        else:
+        sym = _bar_symbol(bar, symbols)
+        if not _append_stream_bar(bar, sym, bars_by_symbol):
             return
-
         if sym != symbols[0]:
             return
 
-        current_allocations = {
-            s: p.shares * p.current_price / portfolio.equity
-            for s, p in portfolio.positions.items()
-            if portfolio.equity > 0
-        }
-
         prev_regime = last_regime_state
-        signals, regime_state = signal_gen.generate(symbols, bars_by_symbol, current_allocations)
+        signals, regime_state = signal_gen.generate(
+            symbols, bars_by_symbol, _allocation_fractions(portfolio),
+        )
         last_regime_state = regime_state
 
         if regime_state:
@@ -246,22 +265,18 @@ def run_trading_loop(config: dict, dry_run: bool = False):
 
         cb_action, cb_reason = risk_manager.circuit_breaker.update(portfolio)
         if cb_action in ("CLOSE_ALL_DAY", "CLOSE_ALL_WEEK", "HALTED"):
-            logger.warning(f"Circuit breaker triggered: {cb_action} — {cb_reason}")
+            logger.warning("Circuit breaker triggered: %s — %s", cb_action, cb_reason)
             alert_manager.send("circuit_breaker", f"Circuit breaker: {cb_action} — {cb_reason}")
             if not dry_run:
                 order_executor.close_all_positions()
             return
 
         for sig in signals:
-            risk_decision = risk_manager.validate_signal(sig, portfolio)
-            if risk_decision.approved:
-                order_executor.submit_order(sig, risk_decision)
+            rd = risk_manager.validate_signal(sig, portfolio)
+            if rd.approved:
+                order_executor.submit_order(sig, rd)
 
-        for sym, pos in portfolio.positions.items():
-            if sym in bars_by_symbol and len(bars_by_symbol[sym]) > 0:
-                current_price = float(bars_by_symbol[sym]["close"].iloc[-1])
-                position_tracker.update_position_price(sym, current_price)
-
+        _sync_position_mark_prices(portfolio, bars_by_symbol, position_tracker)
         save_state_snapshot(portfolio, regime_state)
         dashboard.refresh(portfolio, regime_state, hmm, signals)
 

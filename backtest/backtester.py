@@ -98,6 +98,15 @@ class BacktestResult:
     config: Dict
 
 
+@dataclass
+class _WalkSimState:
+    """Mutable cash / shares / allocation while walking OOS bars."""
+
+    cash: float
+    shares: float
+    current_allocation: float
+
+
 class WalkForwardBacktester:
     """Runs an allocation-based walk-forward backtest using HMM regime detection."""
 
@@ -110,6 +119,85 @@ class WalkForwardBacktester:
         """
         self.cfg = config
         self.bt_cfg = config.get("backtest", {})
+
+    def _simulate_oos_bars(
+        self,
+        symbol: str,
+        bars: pd.DataFrame,
+        oos_bars: pd.DataFrame,
+        oos_start: int,
+        hmm: HMMEngine,
+        orchestrator: StrategyOrchestrator,
+        *,
+        rebalance_threshold: float,
+        fill_delay: int,
+        slippage_pct: float,
+        total_bars: int,
+        walk: _WalkSimState,
+        all_equity: pd.Series,
+        trade_log: List[Trade],
+        regime_rows: list,
+    ) -> int:
+        """One OOS window: update equity path, regime rows, and trades. Returns trade count."""
+        window_trades = 0
+        for i in range(len(oos_bars)):
+            global_idx = oos_start + i
+            current_price = float(oos_bars.iloc[i]["close"])
+            equity = walk.cash + walk.shares * current_price
+            all_equity.iloc[global_idx] = equity
+
+            history_bars = bars.iloc[: oos_start + i + 1]
+            try:
+                regime_state = hmm.predict_regime_filtered(history_bars)
+            except Exception:
+                regime_rows.append({
+                    "timestamp": bars.index[global_idx],
+                    "regime": "UNKNOWN",
+                    "probability": 0.0,
+                })
+                continue
+
+            regime_rows.append({
+                "timestamp": bars.index[global_idx],
+                "regime": regime_state.label,
+                "probability": regime_state.probability,
+                "is_confirmed": regime_state.is_confirmed,
+            })
+
+            signals = orchestrator.generate_signals(
+                symbols=[symbol],
+                bars_by_symbol={symbol: bars.iloc[: oos_start + i + 1]},
+                regime_state=regime_state,
+                is_flickering=hmm.is_flickering(),
+                current_allocations={symbol: walk.current_allocation},
+            )
+            if not signals:
+                continue
+
+            target = signals[0].position_size_pct * signals[0].leverage
+            if abs(target - walk.current_allocation) < rebalance_threshold:
+                continue
+
+            ncash, nshares, nalloc, trade = _delayed_rebalance_trade(
+                symbol=symbol,
+                bars=bars,
+                global_idx=global_idx,
+                fill_delay=fill_delay,
+                total_bars=total_bars,
+                equity=equity,
+                cash=walk.cash,
+                shares=walk.shares,
+                prev_allocation=walk.current_allocation,
+                target_allocation=target,
+                slippage_pct=slippage_pct,
+                regime_state=regime_state,
+            )
+            if trade is None:
+                continue
+            walk.cash, walk.shares, walk.current_allocation = ncash, nshares, nalloc
+            trade_log.append(trade)
+            window_trades += 1
+        return window_trades
 
     def run(
         self,
@@ -138,13 +226,14 @@ class WalkForwardBacktester:
                 f"Need at least {min_start + test_window} bars, got {total_bars}."
             )
 
-        equity = initial_capital
-        cash = initial_capital
-        shares = 0.0
-        current_allocation = 0.0
+        walk = _WalkSimState(
+            cash=initial_capital,
+            shares=0.0,
+            current_allocation=0.0,
+        )
 
         all_equity = pd.Series(index=bars.index, dtype=float)
-        all_equity.iloc[:min_start] = equity
+        all_equity.iloc[:min_start] = initial_capital
         trade_log: List[Trade] = []
         regime_rows = []
         windows = []
@@ -170,68 +259,17 @@ class WalkForwardBacktester:
                 self.cfg.get("strategy", {}), hmm.regime_infos
             )
 
-            window_trades = 0
-            for i in range(len(oos_bars)):
-                global_idx = oos_start + i
-                price_row = oos_bars.iloc[i]
-                current_price = float(price_row["close"])
-
-                equity = cash + shares * current_price
-                all_equity.iloc[global_idx] = equity
-
-                history_bars = bars.iloc[: oos_start + i + 1]
-                try:
-                    regime_state = hmm.predict_regime_filtered(history_bars)
-                except Exception:
-                    regime_rows.append({
-                        "timestamp": bars.index[global_idx],
-                        "regime": "UNKNOWN",
-                        "probability": 0.0,
-                    })
-                    continue
-
-                regime_rows.append({
-                    "timestamp": bars.index[global_idx],
-                    "regime": regime_state.label,
-                    "probability": regime_state.probability,
-                    "is_confirmed": regime_state.is_confirmed,
-                })
-
-                signals = orchestrator.generate_signals(
-                    symbols=[symbol],
-                    bars_by_symbol={symbol: bars.iloc[: oos_start + i + 1]},
-                    regime_state=regime_state,
-                    is_flickering=hmm.is_flickering(),
-                    current_allocations={symbol: current_allocation},
-                )
-
-                if not signals:
-                    continue
-
-                sig = signals[0]
-                target_allocation = sig.position_size_pct * sig.leverage
-
-                if abs(target_allocation - current_allocation) < rebalance_threshold:
-                    continue
-
-                ncash, nshares, nalloc, trade = _delayed_rebalance_trade(
-                    symbol=symbol,
-                    bars=bars,
-                    global_idx=global_idx,
-                    fill_delay=fill_delay,
-                    total_bars=total_bars,
-                    equity=equity,
-                    cash=cash,
-                    shares=shares,
-                    prev_allocation=current_allocation,
-                    target_allocation=target_allocation,
-                    slippage_pct=slippage_pct,
-                    regime_state=regime_state,
-                )
-                if trade is not None:
-                    cash, shares, current_allocation = ncash, nshares, nalloc
-                    trade_log.append(trade)
-                    window_trades += 1
+            window_trades = self._simulate_oos_bars(
+                symbol, bars, oos_bars, oos_start, hmm, orchestrator,
+                rebalance_threshold=rebalance_threshold,
+                fill_delay=fill_delay,
+                slippage_pct=slippage_pct,
+                total_bars=total_bars,
+                walk=walk,
+                all_equity=all_equity,
+                trade_log=trade_log,
+                regime_rows=regime_rows,
+            )
 
             windows.append({
                 "is_start": bars.index[is_end - train_window],

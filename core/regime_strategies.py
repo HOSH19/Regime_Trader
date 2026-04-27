@@ -48,11 +48,8 @@ def _ema(series: pd.Series, span: int) -> pd.Series:
     return series.ewm(span=span, adjust=False).mean()
 
 
-def _compute_stop_and_params(
-    bars: pd.DataFrame,
-    strategy_type: str,
-) -> tuple:
-    """Return (atr, ema50, current_price)."""
+def _compute_stop_and_params(bars: pd.DataFrame) -> tuple:
+    """Return (current_price, atr, ema50)."""
     close = bars["close"] if "close" in bars.columns else bars["Close"]
     high = bars["high"] if "high" in bars.columns else bars["High"]
     low = bars["low"] if "low" in bars.columns else bars["Low"]
@@ -71,6 +68,46 @@ def _cap_long_stop_below_entry(entry: float, stop: float, atr: float) -> float:
     """Clamp raw stop so a LONG bracket is strictly below entry (EMA-based rules can sit above spot)."""
     cushion = max(0.01 * atr, entry * 1e-6, 1e-4)
     return min(stop, entry - cushion)
+
+
+def _strategy_class_for_vol_rank_fraction(position: float) -> type:
+    """Map fractional volatility rank in [0, 1] to Low / Mid / High vol strategy class."""
+    if position <= 0.33:
+        return LowVolBullStrategy
+    if position >= 0.67:
+        return HighVolDefensiveStrategy
+    return MidVolCautiousStrategy
+
+
+def _long_signal(
+    symbol: str,
+    regime_state: RegimeState,
+    price: float,
+    stop: float,
+    alloc: float,
+    leverage: float,
+    reasoning: str,
+    strategy_name: str,
+    metadata: Dict[str, Any],
+) -> Signal:
+    """Assemble a LONG ``Signal`` with shared fields populated from ``regime_state``."""
+    return Signal(
+        symbol=symbol,
+        direction="LONG",
+        confidence=regime_state.probability,
+        entry_price=price,
+        stop_loss=stop,
+        take_profit=None,
+        position_size_pct=alloc,
+        leverage=leverage,
+        regime_id=regime_state.state_id,
+        regime_name=regime_state.label,
+        regime_probability=regime_state.probability,
+        timestamp=utc_now(),
+        reasoning=reasoning,
+        strategy_name=strategy_name,
+        metadata=metadata,
+    )
 
 
 class BaseStrategy(ABC):
@@ -103,32 +140,20 @@ class LowVolBullStrategy(BaseStrategy):
 
     def generate_signal(self, symbol, bars, regime_state) -> Optional[Signal]:
         """Generate a fully allocated long signal with 1.25x leverage in calm low-volatility conditions."""
-        price, atr, ema50 = _compute_stop_and_params(bars, self.name)
+        price, atr, ema50 = _compute_stop_and_params(bars)
         if atr == 0 or price == 0:
             return None
 
-        stop = max(price - 3 * atr, ema50 - 0.5 * atr)
-        stop = _cap_long_stop_below_entry(price, stop, atr)
+        stop = _cap_long_stop_below_entry(price, max(price - 3 * atr, ema50 - 0.5 * atr), atr)
         alloc = self.config.get("low_vol_allocation", 0.95)
         leverage = self.config.get("low_vol_leverage", 1.25)
-
-        return Signal(
-            symbol=symbol,
-            direction="LONG",
-            confidence=regime_state.probability,
-            entry_price=price,
-            stop_loss=stop,
-            take_profit=None,
-            position_size_pct=alloc,
-            leverage=leverage,
-            regime_id=regime_state.state_id,
-            regime_name=regime_state.label,
-            regime_probability=regime_state.probability,
-            timestamp=utc_now(),
-            reasoning=f"Low-vol regime ({regime_state.label}, p={regime_state.probability:.2f}). "
-                      f"Calm market — full allocation with modest leverage.",
-            strategy_name=self.name,
-            metadata={"atr": atr, "ema50": ema50},
+        reason = (
+            f"Low-vol regime ({regime_state.label}, p={regime_state.probability:.2f}). "
+            "Calm market — full allocation with modest leverage."
+        )
+        return _long_signal(
+            symbol, regime_state, price, stop, alloc, leverage, reason, self.name,
+            {"atr": atr, "ema50": ema50},
         )
 
 
@@ -143,39 +168,22 @@ class MidVolCautiousStrategy(BaseStrategy):
 
     def generate_signal(self, symbol, bars, regime_state) -> Optional[Signal]:
         """Generate a long signal sized by whether price is above or below the 50 EMA."""
-        price, atr, ema50 = _compute_stop_and_params(bars, self.name)
+        price, atr, ema50 = _compute_stop_and_params(bars)
         if atr == 0 or price == 0:
             return None
 
         stop = _cap_long_stop_below_entry(price, ema50 - 0.5 * atr, atr)
         trend_intact = price > ema50
-
-        if trend_intact:
-            alloc = self.config.get("mid_vol_allocation_trend", 0.95)
-            leverage = 1.0
-            reason_suffix = "Trend intact (price > 50EMA). Stay invested."
-        else:
-            alloc = self.config.get("mid_vol_allocation_no_trend", 0.60)
-            leverage = 1.0
-            reason_suffix = "Trend broken (price < 50EMA). Reduce allocation."
-
-        return Signal(
-            symbol=symbol,
-            direction="LONG",
-            confidence=regime_state.probability,
-            entry_price=price,
-            stop_loss=stop,
-            take_profit=None,
-            position_size_pct=alloc,
-            leverage=leverage,
-            regime_id=regime_state.state_id,
-            regime_name=regime_state.label,
-            regime_probability=regime_state.probability,
-            timestamp=utc_now(),
-            reasoning=f"Mid-vol regime ({regime_state.label}, p={regime_state.probability:.2f}). {reason_suffix}",
-            strategy_name=self.name,
-            metadata={"atr": atr, "ema50": ema50, "trend_intact": trend_intact},
+        alloc_key = "mid_vol_allocation_trend" if trend_intact else "mid_vol_allocation_no_trend"
+        alloc = self.config.get(alloc_key, 0.95 if trend_intact else 0.60)
+        suffix = (
+            "Trend intact (price > 50EMA). Stay invested."
+            if trend_intact
+            else "Trend broken (price < 50EMA). Reduce allocation."
         )
+        reason = f"Mid-vol regime ({regime_state.label}, p={regime_state.probability:.2f}). {suffix}"
+        meta = {"atr": atr, "ema50": ema50, "trend_intact": trend_intact}
+        return _long_signal(symbol, regime_state, price, stop, alloc, 1.0, reason, self.name, meta)
 
 
 class HighVolDefensiveStrategy(BaseStrategy):
@@ -189,30 +197,19 @@ class HighVolDefensiveStrategy(BaseStrategy):
 
     def generate_signal(self, symbol, bars, regime_state) -> Optional[Signal]:
         """Generate a reduced-allocation long signal to stay positioned for V-shaped rebounds."""
-        price, atr, ema50 = _compute_stop_and_params(bars, self.name)
+        price, atr, ema50 = _compute_stop_and_params(bars)
         if atr == 0 or price == 0:
             return None
 
         stop = _cap_long_stop_below_entry(price, ema50 - 1.0 * atr, atr)
         alloc = self.config.get("high_vol_allocation", 0.60)
-
-        return Signal(
-            symbol=symbol,
-            direction="LONG",
-            confidence=regime_state.probability,
-            entry_price=price,
-            stop_loss=stop,
-            take_profit=None,
-            position_size_pct=alloc,
-            leverage=1.0,
-            regime_id=regime_state.state_id,
-            regime_name=regime_state.label,
-            regime_probability=regime_state.probability,
-            timestamp=utc_now(),
-            reasoning=f"High-vol regime ({regime_state.label}, p={regime_state.probability:.2f}). "
-                      f"Reduced allocation — staying 60% long to catch rebounds.",
-            strategy_name=self.name,
-            metadata={"atr": atr, "ema50": ema50},
+        reason = (
+            f"High-vol regime ({regime_state.label}, p={regime_state.probability:.2f}). "
+            "Reduced allocation — staying 60% long to catch rebounds."
+        )
+        return _long_signal(
+            symbol, regime_state, price, stop, alloc, 1.0, reason, self.name,
+            {"atr": atr, "ema50": ema50},
         )
 
 
@@ -254,15 +251,10 @@ class StrategyOrchestrator:
         if n == 0:
             return
 
+        denom = max(n - 1, 1)
         sorted_by_vol = sorted(regime_infos, key=lambda r: r.expected_volatility)
         for rank, info in enumerate(sorted_by_vol):
-            position = rank / max(n - 1, 1)
-            if position <= 0.33:
-                strategy_cls = LowVolBullStrategy
-            elif position >= 0.67:
-                strategy_cls = HighVolDefensiveStrategy
-            else:
-                strategy_cls = MidVolCautiousStrategy
+            strategy_cls = _strategy_class_for_vol_rank_fraction(rank / denom)
             self._strategy_map[info.regime_id] = strategy_cls(self.config)
 
     def update_regime_infos(self, regime_infos: List[RegimeInfo]):

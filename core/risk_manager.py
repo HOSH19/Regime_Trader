@@ -129,35 +129,66 @@ class CircuitBreaker:
         Returns (action, reason).
         action: NORMAL | REDUCE_50 | CLOSE_ALL | HALTED
         """
+        hit = self._locked_halt()
+        if hit:
+            return hit
+        hit = self._peak_equity_halt(portfolio)
+        if hit:
+            return hit
+        hit = self._weekly_halt(portfolio)
+        if hit:
+            return hit
+        hit = self._weekly_reduce(portfolio)
+        if hit:
+            return hit
+        hit = self._daily_halt(portfolio)
+        if hit:
+            return hit
+        hit = self._daily_reduce(portfolio)
+        if hit:
+            return hit
+        return "NORMAL", ""
+
+    def _locked_halt(self) -> Optional[Tuple[str, str]]:
         if os.path.exists(TRADING_HALTED_LOCK):
             return "HALTED", "trading_halted.lock file present — manual intervention required"
+        return None
 
-        daily_dd = portfolio.daily_drawdown
-        weekly_dd = portfolio.weekly_drawdown
-        peak_dd = portfolio.drawdown_from_peak
+    def _peak_equity_halt(self, portfolio: PortfolioState) -> Optional[Tuple[str, str]]:
+        lim = self.cfg.get("max_dd_from_peak", 0.10)
+        dd = portfolio.drawdown_from_peak
+        if dd > -lim:
+            return None
+        self._write_lock_file(portfolio)
+        return "HALTED", f"Peak DD {dd*100:.1f}% exceeds {lim*100:.0f}% limit"
 
-        max_dd = self.cfg.get("max_dd_from_peak", 0.10)
-        if peak_dd <= -max_dd:
-            self._write_lock_file(portfolio)
-            return "HALTED", f"Peak DD {peak_dd*100:.1f}% exceeds {max_dd*100:.0f}% limit"
+    def _weekly_halt(self, portfolio: PortfolioState) -> Optional[Tuple[str, str]]:
+        lim = self.cfg.get("weekly_dd_halt", 0.07)
+        dd = portfolio.weekly_drawdown
+        if dd > -lim:
+            return None
+        return "CLOSE_ALL_WEEK", f"Weekly DD {dd*100:.1f}% exceeds {lim*100:.0f}% limit"
 
-        weekly_halt = self.cfg.get("weekly_dd_halt", 0.07)
-        if weekly_dd <= -weekly_halt:
-            return "CLOSE_ALL_WEEK", f"Weekly DD {weekly_dd*100:.1f}% exceeds {weekly_halt*100:.0f}% limit"
+    def _weekly_reduce(self, portfolio: PortfolioState) -> Optional[Tuple[str, str]]:
+        lim = self.cfg.get("weekly_dd_reduce", 0.05)
+        dd = portfolio.weekly_drawdown
+        if dd > -lim:
+            return None
+        return "REDUCE_50_WEEK", f"Weekly DD {dd*100:.1f}% exceeds {lim*100:.0f}% reduce threshold"
 
-        weekly_reduce = self.cfg.get("weekly_dd_reduce", 0.05)
-        if weekly_dd <= -weekly_reduce:
-            return "REDUCE_50_WEEK", f"Weekly DD {weekly_dd*100:.1f}% exceeds {weekly_reduce*100:.0f}% reduce threshold"
+    def _daily_halt(self, portfolio: PortfolioState) -> Optional[Tuple[str, str]]:
+        lim = self.cfg.get("daily_dd_halt", 0.03)
+        dd = portfolio.daily_drawdown
+        if dd > -lim:
+            return None
+        return "CLOSE_ALL_DAY", f"Daily DD {dd*100:.1f}% exceeds {lim*100:.0f}% limit"
 
-        daily_halt = self.cfg.get("daily_dd_halt", 0.03)
-        if daily_dd <= -daily_halt:
-            return "CLOSE_ALL_DAY", f"Daily DD {daily_dd*100:.1f}% exceeds {daily_halt*100:.0f}% limit"
-
-        daily_reduce = self.cfg.get("daily_dd_reduce", 0.02)
-        if daily_dd <= -daily_reduce:
-            return "REDUCE_50_DAY", f"Daily DD {daily_dd*100:.1f}% exceeds {daily_reduce*100:.0f}% reduce threshold"
-
-        return "NORMAL", ""
+    def _daily_reduce(self, portfolio: PortfolioState) -> Optional[Tuple[str, str]]:
+        lim = self.cfg.get("daily_dd_reduce", 0.02)
+        dd = portfolio.daily_drawdown
+        if dd > -lim:
+            return None
+        return "REDUCE_50_DAY", f"Daily DD {dd*100:.1f}% exceeds {lim*100:.0f}% reduce threshold"
 
     def _write_lock_file(self, portfolio: PortfolioState):
         """Write the halt lock file to disk, requiring manual deletion to resume trading."""
@@ -215,72 +246,110 @@ class RiskManager:
         duplicate-trade blocks, max concurrent positions, position sizing, leverage,
         and total exposure. May approve, reject, or return a modified signal.
         """
-        modifications = []
-
+        modifications: List[str] = []
         cb_action, cb_reason = self.circuit_breaker.update(portfolio)
-        if cb_action in ("HALTED", "CLOSE_ALL_DAY", "CLOSE_ALL_WEEK"):
-            return RiskDecision(
-                approved=False,
-                modified_signal=None,
-                rejection_reason=f"Circuit breaker: {cb_action} — {cb_reason}",
-            )
 
-        if cb_action in ("REDUCE_50_DAY", "REDUCE_50_WEEK"):
-            signal = Signal(**{**signal.__dict__, "position_size_pct": signal.position_size_pct * 0.5})
-            modifications.append(f"Size halved due to {cb_action}")
+        decision = self._reject_circuit_hard_stop(cb_action, cb_reason)
+        if decision:
+            return decision
 
-        if not signal.stop_loss or signal.stop_loss <= 0:
-            return RiskDecision(
-                approved=False,
-                modified_signal=None,
-                rejection_reason="Signal rejected: missing stop_loss",
-            )
+        signal, modifications = self._apply_circuit_size_reduction(cb_action, signal, modifications)
 
-        if self._daily_trade_count >= self.risk_cfg.get("max_daily_trades", 20):
-            return RiskDecision(
-                approved=False,
-                modified_signal=None,
-                rejection_reason=f"Daily trade limit reached ({self._daily_trade_count})",
-            )
+        for reject in (
+            self._reject_bad_stop(signal),
+            self._reject_daily_trade_cap(),
+            self._reject_duplicate_symbol(signal),
+            self._reject_max_positions(portfolio),
+        ):
+            if reject:
+                return reject
 
-        dup_block = self.risk_cfg.get("duplicate_block_seconds", 60)
-        last_time = self._last_trade_times.get(signal.symbol, 0)
-        if time.time() - last_time < dup_block:
-            return RiskDecision(
-                approved=False,
-                modified_signal=None,
-                rejection_reason=f"Duplicate trade blocked: {signal.symbol} traded within {dup_block}s",
-            )
-
-        if portfolio.n_positions >= self.risk_cfg.get("max_concurrent", 5):
-            return RiskDecision(
-                approved=False,
-                modified_signal=None,
-                rejection_reason=f"Max concurrent positions ({self.risk_cfg.get('max_concurrent', 5)}) reached",
-            )
-
-        signal, size_mods = self._apply_position_sizing(signal, portfolio)
-        modifications.extend(size_mods)
-
-        leverage_ok, lev_reason = self._check_leverage(signal, portfolio)
-        if not leverage_ok:
-            signal = Signal(**{**signal.__dict__, "leverage": 1.0})
-            modifications.append(lev_reason)
+        signal, modifications = self._apply_position_and_leverage(signal, portfolio, modifications)
 
         exposure_ok, exp_reason = self._check_exposure(signal, portfolio)
         if not exposure_ok:
-            return RiskDecision(
-                approved=False,
-                modified_signal=None,
-                rejection_reason=exp_reason,
-            )
+            return RiskDecision(approved=False, modified_signal=None, rejection_reason=exp_reason)
 
+        return self._finalize_approval(signal, portfolio, modifications)
+
+    @staticmethod
+    def _reject_circuit_hard_stop(cb_action: str, cb_reason: str) -> Optional[RiskDecision]:
+        if cb_action not in ("HALTED", "CLOSE_ALL_DAY", "CLOSE_ALL_WEEK"):
+            return None
+        return RiskDecision(
+            approved=False,
+            modified_signal=None,
+            rejection_reason=f"Circuit breaker: {cb_action} — {cb_reason}",
+        )
+
+    @staticmethod
+    def _apply_circuit_size_reduction(
+        cb_action: str, signal: Signal, modifications: List[str]
+    ) -> Tuple[Signal, List[str]]:
+        if cb_action not in ("REDUCE_50_DAY", "REDUCE_50_WEEK"):
+            return signal, modifications
+        signal = Signal(**{**signal.__dict__, "position_size_pct": signal.position_size_pct * 0.5})
+        return signal, [*modifications, f"Size halved due to {cb_action}"]
+
+    @staticmethod
+    def _reject_bad_stop(signal: Signal) -> Optional[RiskDecision]:
+        if signal.stop_loss and signal.stop_loss > 0:
+            return None
+        return RiskDecision(
+            approved=False,
+            modified_signal=None,
+            rejection_reason="Signal rejected: missing stop_loss",
+        )
+
+    def _reject_daily_trade_cap(self) -> Optional[RiskDecision]:
+        cap = self.risk_cfg.get("max_daily_trades", 20)
+        if self._daily_trade_count < cap:
+            return None
+        return RiskDecision(
+            approved=False,
+            modified_signal=None,
+            rejection_reason=f"Daily trade limit reached ({self._daily_trade_count})",
+        )
+
+    def _reject_duplicate_symbol(self, signal: Signal) -> Optional[RiskDecision]:
+        dup_block = self.risk_cfg.get("duplicate_block_seconds", 60)
+        elapsed = time.time() - self._last_trade_times.get(signal.symbol, 0)
+        if elapsed >= dup_block:
+            return None
+        return RiskDecision(
+            approved=False,
+            modified_signal=None,
+            rejection_reason=f"Duplicate trade blocked: {signal.symbol} traded within {dup_block}s",
+        )
+
+    def _reject_max_positions(self, portfolio: PortfolioState) -> Optional[RiskDecision]:
+        cap = self.risk_cfg.get("max_concurrent", 5)
+        if portfolio.n_positions < cap:
+            return None
+        return RiskDecision(
+            approved=False,
+            modified_signal=None,
+            rejection_reason=f"Max concurrent positions ({cap}) reached",
+        )
+
+    def _apply_position_and_leverage(
+        self, signal: Signal, portfolio: PortfolioState, modifications: List[str]
+    ) -> Tuple[Signal, List[str]]:
+        signal, size_mods = self._apply_position_sizing(signal, portfolio)
+        modifications = [*modifications, *size_mods]
+        leverage_ok, lev_reason = self._check_leverage(signal, portfolio)
+        if leverage_ok:
+            return signal, modifications
+        signal = Signal(**{**signal.__dict__, "leverage": 1.0})
+        return signal, [*modifications, lev_reason]
+
+    def _finalize_approval(
+        self, signal: Signal, portfolio: PortfolioState, modifications: List[str]
+    ) -> RiskDecision:
         self._daily_trade_count += 1
         self._last_trade_times[signal.symbol] = time.time()
-
         if portfolio.peak_equity < portfolio.equity:
             portfolio.peak_equity = portfolio.equity
-
         return RiskDecision(
             approved=True,
             modified_signal=signal,
@@ -367,4 +436,4 @@ class RiskManager:
 
     def reset_weekly_counters(self):
         """Reset weekly-level risk counters at the start of each trading week."""
-        return
+        pass

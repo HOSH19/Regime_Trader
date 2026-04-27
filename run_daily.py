@@ -173,6 +173,98 @@ def _portfolio_and_positions(alpaca, prev_snapshot: dict):
     return portfolio, positions_list, equity
 
 
+def _current_allocations(portfolio, equity: float) -> dict:
+    if equity <= 0:
+        return {}
+    return {
+        sym: pos.shares * pos.current_price / equity
+        for sym, pos in portfolio.positions.items()
+    }
+
+
+def _execute_signals_to_orders(signals, portfolio, risk_manager, order_executor, equity: float):
+    """Validate each signal, submit orders, and build briefing payloads."""
+    signal_dicts = []
+    orders_placed = []
+    for sig in signals:
+        risk_decision = risk_manager.validate_signal(sig, portfolio)
+        if not (risk_decision.approved and risk_decision.modified_signal):
+            continue
+        s = risk_decision.modified_signal
+        order_id = order_executor.submit_order(sig, risk_decision)
+        if order_id:
+            qty = int(equity * s.position_size_pct * s.leverage / s.entry_price)
+            orders_placed.append({
+                "symbol": s.symbol, "side": "BUY", "qty": qty,
+                "price": round(s.entry_price * 1.001, 2), "order_id": order_id,
+            })
+        signal_dicts.append({
+            "symbol": s.symbol, "direction": s.direction,
+            "alloc_pct": s.position_size_pct * 100,
+            "entry": s.entry_price,
+        })
+    return signal_dicts, orders_placed
+
+
+def _send_closed_market_telegram(
+    telegram, logger, *,
+    market_status, next_open_str, regime_state, hmm, stale_max,
+    equity, positions_list, stock_prices, paper_trading, news,
+):
+    sent = telegram.send_market_summary(
+        date=utc_now(),
+        market_status=market_status,
+        next_open=next_open_str,
+        regime_label=regime_state.label,
+        regime_prob=regime_state.probability,
+        regime_stability=hmm.get_regime_stability(),
+        is_flickering=hmm.is_flickering(),
+        equity=equity,
+        positions=positions_list,
+        stock_prices=stock_prices,
+        paper_trading=paper_trading,
+        hmm_age_days=(utc_now() - ensure_utc(hmm.training_date)).days if hmm.training_date else 0,
+        hmm_stale_max_days=stale_max,
+        news=news,
+    )
+    if telegram.enabled and not sent:
+        logger.error(
+            "Telegram summary was not delivered. Check logs for 'Telegram send failed' — "
+            "token/chat_id in GitHub secrets (same Environment as the workflow) or revoke/regenerate bot."
+        )
+
+
+def _send_open_market_briefing(
+    telegram, logger, *,
+    regime_state, hmm, equity, portfolio, signal_dicts, orders_placed,
+    positions_list, paper_trading, news,
+):
+    daily_pnl = equity - (portfolio.daily_start_equity or equity)
+    d0 = portfolio.daily_start_equity or 0.0
+    daily_pnl_pct = (daily_pnl / d0 * 100) if d0 else 0.0
+    sent = telegram.send_daily_briefing(
+        date=utc_now(),
+        regime_label=regime_state.label,
+        regime_prob=regime_state.probability,
+        regime_stability=hmm.get_regime_stability(),
+        is_flickering=hmm.is_flickering(),
+        equity=equity,
+        daily_pnl=daily_pnl,
+        daily_pnl_pct=daily_pnl_pct,
+        circuit_breaker=portfolio.circuit_breaker_status,
+        signals=signal_dicts,
+        orders_placed=orders_placed,
+        positions=positions_list,
+        paper_trading=paper_trading,
+        news=news,
+    )
+    if telegram.enabled and not sent:
+        logger.error(
+            "Telegram briefing was not delivered. Check logs for 'Telegram send failed' — "
+            "token/chat_id in GitHub secrets (same Environment as the workflow)."
+        )
+
+
 def run():
     """
     Execute the daily trading pipeline.
@@ -224,8 +316,6 @@ def run():
         hmm = _load_or_train_hmm(config, primary_bars, logger)
 
         regime_state = hmm.predict_regime_filtered(primary_bars)
-        is_flickering = hmm.is_flickering()
-        hmm_age_days = (utc_now() - ensure_utc(hmm.training_date)).days if hmm.training_date else 0
 
         prev_snapshot = _load_prev_snapshot()
         portfolio, positions_list, equity = _portfolio_and_positions(alpaca, prev_snapshot)
@@ -233,97 +323,55 @@ def run():
         news = fetch_news_for_symbols(symbols)
 
         if not market_open:
-            stock_prices = _stock_price_summary(bars_by_symbol)
-            sent = telegram.send_market_summary(
-                date=utc_now(),
+            _send_closed_market_telegram(
+                telegram, logger,
                 market_status=market_status,
-                next_open=next_open_str,
-                regime_label=regime_state.label,
-                regime_prob=regime_state.probability,
-                regime_stability=hmm.get_regime_stability(),
-                is_flickering=is_flickering,
+                next_open_str=next_open_str,
+                regime_state=regime_state,
+                hmm=hmm,
+                stale_max=stale_max,
                 equity=equity,
-                positions=positions_list,
-                stock_prices=stock_prices,
+                positions_list=positions_list,
+                stock_prices=_stock_price_summary(bars_by_symbol),
                 paper_trading=paper_trading,
-                hmm_age_days=hmm_age_days,
-                hmm_stale_max_days=stale_max,
                 news=news,
             )
-            if telegram.enabled and not sent:
-                logger.error(
-                    "Telegram summary was not delivered. Check logs for 'Telegram send failed' — "
-                    "token/chat_id in GitHub secrets (same Environment as the workflow) or revoke/regenerate bot."
-                )
             _save_snapshot(portfolio, regime_state, prev_snapshot)
             return
 
         risk_manager = RiskManager(config)
         cb_action, cb_reason = risk_manager.circuit_breaker.check(portfolio)
         if cb_action in ("HALTED", "CLOSE_ALL_DAY", "CLOSE_ALL_WEEK"):
-            logger.warning(f"Circuit breaker: {cb_action} — {cb_reason}")
+            logger.warning("Circuit breaker: %s — %s", cb_action, cb_reason)
             telegram.send_alert("circuit_breaker", f"{cb_action}: {cb_reason}")
             _save_snapshot(portfolio, regime_state, prev_snapshot)
             return
 
         orchestrator = StrategyOrchestrator(config.get("strategy", {}), hmm.regime_infos)
         signal_gen = SignalGenerator(hmm, orchestrator, config)
-
-        current_allocations = {
-            sym: pos.shares * pos.current_price / equity
-            for sym, pos in portfolio.positions.items() if equity > 0
-        }
-
-        signals, _ = signal_gen.generate(symbols, bars_by_symbol, current_allocations)
+        signals, _ = signal_gen.generate(
+            symbols, bars_by_symbol, _current_allocations(portfolio, equity),
+        )
 
         order_executor = OrderExecutor(alpaca, dry_run=False)
-        signal_dicts = []
-        orders_placed = []
-
-        for sig in signals:
-            risk_decision = risk_manager.validate_signal(sig, portfolio)
-            if risk_decision.approved and risk_decision.modified_signal:
-                s = risk_decision.modified_signal
-                order_id = order_executor.submit_order(sig, risk_decision)
-                if order_id:
-                    qty = int(equity * s.position_size_pct * s.leverage / s.entry_price)
-                    orders_placed.append({
-                        "symbol": s.symbol, "side": "BUY", "qty": qty,
-                        "price": round(s.entry_price * 1.001, 2), "order_id": order_id,
-                    })
-                signal_dicts.append({
-                    "symbol": s.symbol, "direction": s.direction,
-                    "alloc_pct": s.position_size_pct * 100,
-                    "entry": s.entry_price,
-                })
+        signal_dicts, orders_placed = _execute_signals_to_orders(
+            signals, portfolio, risk_manager, order_executor, equity,
+        )
 
         _save_snapshot(portfolio, regime_state, prev_snapshot)
 
-        daily_pnl = equity - (portfolio.daily_start_equity or equity)
-        daily_pnl_pct = (daily_pnl / portfolio.daily_start_equity * 100) if portfolio.daily_start_equity else 0.0
-
-        sent = telegram.send_daily_briefing(
-            date=utc_now(),
-            regime_label=regime_state.label,
-            regime_prob=regime_state.probability,
-            regime_stability=hmm.get_regime_stability(),
-            is_flickering=is_flickering,
+        _send_open_market_briefing(
+            telegram, logger,
+            regime_state=regime_state,
+            hmm=hmm,
             equity=equity,
-            daily_pnl=daily_pnl,
-            daily_pnl_pct=daily_pnl_pct,
-            circuit_breaker=portfolio.circuit_breaker_status,
-            signals=signal_dicts,
+            portfolio=portfolio,
+            signal_dicts=signal_dicts,
             orders_placed=orders_placed,
-            positions=positions_list,
+            positions_list=positions_list,
             paper_trading=paper_trading,
             news=news,
         )
-        if telegram.enabled and not sent:
-            logger.error(
-                "Telegram briefing was not delivered. Check logs for 'Telegram send failed' — "
-                "token/chat_id in GitHub secrets (same Environment as the workflow)."
-            )
-
 
     except Exception as e:
         logger.critical(f"Run failed: {e}\n{traceback.format_exc()}")
