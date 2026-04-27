@@ -15,6 +15,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     environment: traderbot
+    permissions:
+      contents: write
 
     env:
       ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
@@ -109,4 +111,18 @@ jobs:
           path: |
             ${{ env.PROJECT_DIR }}/hmm_model.pkl
             ${{ env.PROJECT_DIR }}/state_snapshot.json
-          key: regime-${{ runner.os }}-${{ hashFiles('**/config/settings.yaml') }}
+          key: regime-v2-${{ runner.os }}-${{ hashFiles('**/config/settings.yaml') }}
+
+      - name: Commit updated HMM model if retrained
+        if: always()
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add hmm_model.pkl
+          if git diff --cached --quiet; then
+            echo "Model unchanged — skipping commit"
+          else
+            git commit -m "chore: update HMM model [$(date -u +'%Y-%m-%d')]"
+            git push
+          fi

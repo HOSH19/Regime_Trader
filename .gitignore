@@ -4,6 +4,7 @@ config/credentials.yaml
 __pycache__/
 *.pkl
 *.pickle
+!hmm_model.pkl
 logs/
 state_snapshot.json
 trading_halted.lock
