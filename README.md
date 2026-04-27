@@ -1,183 +1,86 @@
-# TraderBot 🤖
+# Regime Trader
 
-A fully automated, HMM-based regime trading bot that trades US equities via Alpaca's paper/live API. Runs as a daily cron job and delivers a Telegram briefing every evening including regime analysis, portfolio state, orders placed, and top news headlines per ticker.
+Automated US-equity regime detection and **allocation** control: a Gaussian HMM summarizes the market into volatility-ordered states; a strategy layer maps those states to target long exposure; a separate risk layer can veto or resize any order. The engineered pieces are the feature pipeline, the bias-aware HMM interface, the walk-forward backtester, and the drawdown-first risk rules—not directional alpha.
 
-**Philosophy: risk management > signal generation.**
-
-The edge is not in predicting market direction — it's in being fully invested during calm markets and reducing exposure during turbulent ones. When you cut your worst drawdowns in half, compounding works in your favour over time.
+**Design principle:** risk management and exposure discipline matter more than signal quality. The HMM is treated as a **volatility / environment classifier**, not a return forecaster. The stack is **long-only** so late regime exits do not fight sharp recoveries with short exposure.
 
 ---
 
-## How It Works
+## Feature engineering
 
-```
-Every weekday at 4:05 PM ET (cron)
-        │
-        ▼
-data/market_data.py         Fetch daily OHLCV bars from Alpaca (IEX feed)
-        │
-        ▼
-data/feature_engineering.py Compute 14 OHLCV features, rolling z-score normalised
-        │
-        ▼
-core/hmm_engine.py          Gaussian HMM — BIC model selection, forward algorithm
-        │                   (no look-ahead bias), regime labelling
-        ▼
-core/regime_strategies.py   Volatility-rank → allocation size (always LONG)
-        │
-        ▼
-core/risk_manager.py        Circuit breakers — absolute veto power over all orders
-        │
-        ▼
-broker/                     Alpaca client, LIMIT/bracket orders, position tracker
-        │
-        ▼
-monitoring/                 Structured JSON logs, Telegram daily briefing + news
-```
+All observables are built in `data/feature_engineering.py` from **OHLCV only**, using information available **at or before** each bar. Every column is passed through a **252-trading-day rolling z-score** (mean and standard deviation of the raw feature over that window) so the HMM sees comparable scales across regimes and calendar periods.
 
-**The HMM is a volatility classifier, not a price predictor.** It detects calm vs turbulent market environments. The strategy layer uses this to set portfolio allocation — fully invested in calm markets, reduced in turbulent ones.
+| Feature | Construction |
+|--------|----------------|
+| `ret_1`, `ret_5`, `ret_20` | Log returns over 1, 5, and 20 days, z-scored |
+| `realized_vol` | 20-day rolling std of daily log returns, z-scored |
+| `vol_ratio` | Short (5d) vs long (20d) realized vol ratio, z-scored |
+| `vol_norm` | Volume z-score vs 50-day rolling mean/std |
+| `vol_trend` | First difference of 10-day volume SMA, z-scored |
+| `adx` | 14-period ADX (trend strength), z-scored |
+| `sma50_slope` | One-day change in 50-day SMA of close, z-scored |
+| `rsi_zscore` | RSI(14) expressed as rolling z-score vs its 252-day history |
+| `dist_sma200` | Fractional distance of close from its 200-day SMA, z-scored |
+| `roc_10`, `roc_20` | Rate of change over 10 and 20 days, z-scored |
+| `norm_atr` | ATR(14) / close (volatility scale vs price), z-scored |
 
-**Always LONG, never SHORT.** V-shaped recoveries happen fast and the HMM is 2–3 days late detecting them. Shorting during rebounds wipes out crash gains.
+Rows with any missing feature (warm-up) are dropped before training or inference. The matrix fed to the HMM is **strictly causal**: no future bars, no Viterbi-smoothed states as inputs.
 
 ---
 
-## Features
+## Regime detection (HMM)
 
-- **Hidden Markov Model** — Gaussian HMM with BIC model selection (tests 3–7 regimes), manual forward algorithm to eliminate look-ahead bias, regime stability filter and flicker detection
-- **14 engineered features** — log returns (1/5/20 day), realised volatility, vol ratio, volume z-score, ADX, SMA slope, RSI z-score, SMA200 distance, ROC, normalised ATR — all 252-period rolling z-score standardised
-- **Walk-forward backtesting** — in-sample 252 days, out-of-sample 126 days, fill delay (signal day N, execute day N+1 open), slippage
-- **Volatility-ranked allocation** — three strategy tiers mapped to HMM regime volatility rank, uncertainty mode halves position sizes
-- **Circuit breakers** — daily drawdown halt, weekly drawdown halt, peak drawdown hard stop — independent veto power
-- **Alpaca integration** — paper and live trading, LIMIT orders, bracket OCO orders, stop tightening, exponential backoff reconnection
-- **Telegram daily briefing** — regime, portfolio P&L, signals, orders placed, top news headline per ticker (NewsAPI)
-- **Cron-based** — no persistent server required; adapts automatically between market-open (full pipeline) and market-closed (summary only) runs
+Implemented in `core/hmm_engine.py`:
 
----
-
-## Quick Start
-
-### 1. Clone and create environment
-
-```bash
-git clone https://github.com/HOSH19/TraderBot.git
-cd TraderBot
-
-conda create -n regime-trader python=3.11 -y
-conda activate regime-trader
-pip install -r requirements.txt
-```
-
-### 2. Set up credentials
-
-```bash
-cp .env.example .env
-```
-
-Edit `.env` and fill in your keys:
-
-```env
-ALPACA_API_KEY=your_key_here
-ALPACA_SECRET_KEY=your_secret_here
-ALPACA_PAPER=true
-
-TELEGRAM_BOT_TOKEN=your_bot_token
-TELEGRAM_CHAT_ID=your_chat_id
-
-NEWSAPI_KEY=your_newsapi_key  
-```
-
-- **Alpaca keys** — free paper trading account at [alpaca.markets](https://alpaca.markets) → Paper Trading → API Keys
-- **Telegram bot** — message [@BotFather](https://t.me/BotFather) → `/newbot` → copy token. Then visit `https://api.telegram.org/bot<TOKEN>/getUpdates` to get your `chat_id`
-- **NewsAPI key** — free tier (100 req/day) at [newsapi.org/register](https://newsapi.org/register)
-
-### 3. Configure your tickers
-
-Edit `config/settings.yaml`:
-
-```yaml
-broker:
-  symbols: [AAPL, TSLA, GOOGL, NVDA, AMD]
-  paper_trading: true
-```
-
-### 4. Test your setup
-
-```bash
-# Test Alpaca API connection
-python -m pytest tests/test_alpaca_api.py -v
-
-# Send a real Telegram message with live data
-python tests/test_telegram.py
-```
-
-### 5. Set up the daily cron job
-
-```bash
-crontab -e
-```
-
-Add this line (runs Mon–Fri at 4:05 PM ET = 21:05 UTC):
-
-```
-5 21 * * 1-5 /path/to/conda/envs/regime-trader/bin/python /path/to/TraderBot/run_daily.py >> /path/to/TraderBot/logs/cron.log 2>&1
-```
-
-That's it. The bot runs automatically every weekday evening.
+- **Model:** `hmmlearn` Gaussian HMM, full covariance, multiple random inits (`n_init`), BIC-driven choice of **3–7** hidden states (`n_candidates`).
+- **Live / sequential inference:** filtered state probabilities use a **manual forward algorithm** only. **Viterbi / `predict()` is not used** for real-time regime probabilities, avoiding smoothed (look-ahead) state paths on the streaming boundary.
+- **Training-time labeling:** Viterbi is used **offline** on the training window only to assign each mixture component a **return-ranked** human label (e.g. bear → bull ordering). Within that, **volatility rank** per state selects one of three **strategy templates** (calm / mid / defensive) with different caps on leverage and max position size.
+- **Stability filter:** a raw argmax state must persist for `stability_bars` before the **confirmed** regime flips; unconfirmed bars still expose probabilities and labels for risk/UI.
+- **Flicker:** recent confirmed transitions are counted over `flicker_window`; above `flicker_threshold`, downstream logic can treat the model as unstable (e.g. uncertainty sizing).
+- **Persistence:** model + metadata are serialized; **retraining is triggered by calendar age** (`stale_max_days`), not by whether the cash session is open.
 
 ---
 
-## Running Manually
+## Strategy layer
 
-```bash
-# Full pipeline run (works any time — adapts to market hours)
-python run_daily.py
+Implemented in `core/regime_strategies.py` and driven by `config/settings.yaml` under `strategy`:
 
-# Walk-forward backtest
-python main.py --backtest --symbols AAPL --start 2020-01-01 --end 2024-12-31
+- **Regime → handler:** each HMM state maps to a **low / mid / high volatility** strategy class according to that state’s volatility rank among all states.
+- **Allocation:** target long fraction of equity (and optional leverage on the calm tier) from configured floors/ceilings; **mid-vol** tier can distinguish trend vs range using price vs SMA200.
+- **Rebalance deadband:** orders are suppressed unless target allocation differs from current allocation by at least `rebalance_threshold` (fraction of equity).
+- **Uncertainty:** low confidence or flicker scales size by `uncertainty_size_mult`.
+- **Signals:** the orchestrator emits **long** targets per symbol; there is no short book by design.
 
-# Backtest with benchmark comparison
-python main.py --backtest --symbols AAPL --start 2020-01-01 --end 2024-12-31 --compare
-
-# Stress test
-python main.py --stress-test --symbols AAPL --start 2020-01-01 --end 2024-12-31
-
-# Train HMM only
-python main.py --train-only
-```
+`core/signal_generator.py` wires HMM state + orchestrator into a single pipeline used by live code and backtests.
 
 ---
 
-## What the Telegram Message Looks Like
+## Risk layer
 
-**Weekday (market open / after close) — full briefing:**
-```
-🤖 HMM TRADER DAILY BRIEFING
-📅 Monday, Apr 14 2026  |  📄 PAPER
+Implemented in `core/risk_manager.py` and applied before any order reaches the broker:
 
-📊 REGIME
-🐂 BULL (98% confidence)
-Stability: 5 bars
+- **Circuit breaker:** hierarchical actions from intraday / weekly drawdown soft thresholds through **hard halt** from peak drawdown; extreme peak breach can write a **lock file** requiring manual removal.
+- **Per-trade sizing:** risk budget per trade, **gap-risk multiplier** on stop distance for overnight-aware share counts, min notional, max single name, max gross exposure, max concurrent positions, leverage caps tightened when multiple positions or breaker soft states apply.
+- **Operational guards:** duplicate trade time window, mandatory stop on signal, spread-related rejects (where used), correlation caps (config present for portfolio-level constraints).
 
-💼 PORTFOLIO
-Equity: $100,000.00
-📈 Daily P&L: +$320.00 (+0.32%)
-From Peak: 0.0%  ✅
-Circuit Breaker: NORMAL ✅
+Risk checks are **independent of HMM correctness**: even with wrong regimes, drawdown rules still apply to realized equity.
 
-🎯 TODAY'S SIGNALS
-• AAPL: LONG 25% @ $261.00  stop $248.95
-• NVDA: LONG 20% @ $189.50  stop $180.52
+---
 
-📋 ORDERS PLACED
-• AAPL: BUY 95 shares @ $261.26 (LIMIT)
+## Backtesting and evaluation
 
-📦 OPEN POSITIONS
-• TSLA: 40 shares  📈 +2.3%  stop $335.00
+- **`backtest/backtester.py`:** **walk-forward** runs: train HMM on an in-sample window (default 252 sessions), simulate out-of-sample (default 126), step the window forward. The simulator is **allocation-based** (target weights, rebalance when the deadband is crossed), not a full fill simulator for every tick.
+- **Execution model:** signal at bar *t*, optional **fill delay** at bar *t+1* open plus **slippage**; equity path and a rebalance **trade log** are recorded together with **regime history**.
+- **`backtest/performance.py`:** returns, drawdown, Sharpe/Sortino/Calmar, trade statistics, buy-and-hold / SMA(200) / random-allocation benchmarks, Rich report output.
+- **`backtest/stress_test.py`:** Monte Carlo **crash gaps** (multiplicative shocks), **ATR-scaled overnight gaps**, and **shuffled close paths** to stress drawdowns and dependence on regime ordering.
 
-📰 TOP NEWS
-• AAPL: Apple Unveils New AI Features... — Bloomberg  2h ago
-• TSLA: Down 30% From Highs, Should You Buy?... — Motley Fool  4h ago
-...
+---
 
-Next run: tomorrow after market close
-```
+## Automation and monitoring
+
+- **`run_daily.py`:** single entry for scheduled runs: loads config, fetches bars, **loads or retrains HMM if stale**, computes regime, pulls account state, optionally fetches **NewsAPI** headlines, then either **full trading path** (signals, risk, Alpaca orders) or **closed-market Telegram summary** without placing orders.
+- **`monitoring/telegram_notifier.py`:** HTML messages for **daily briefing** (open session) vs **market summary** (weekend / post-close copy paths), plus alert helper for failures and breaker events.
+- **`monitoring/`:** structured rotating logs, optional webhooks/email hooks for alerts, terminal dashboard for local monitoring.
+- **CI:** GitHub Actions can run the daily script on a fixed UTC schedule; model and snapshot state can be cached between runs.
+
+Configuration for all of the above lives in **`config/settings.yaml`** (broker, HMM, strategy, risk, backtest, monitoring).
