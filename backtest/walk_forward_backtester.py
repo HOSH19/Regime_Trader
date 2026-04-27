@@ -1,121 +1,33 @@
-"""
-Walk-forward allocation backtester.
+"""Walk-forward engine: retrain HMM in-sample, simulate target weights out-of-sample.
 
-This is an ALLOCATION-BASED backtester. It does NOT track individual trade
-entries and exits. It sets a target portfolio allocation each bar based on the
-detected volatility regime and rebalances when the allocation changes meaningfully.
-
-IS window:  252 trading days (1 year) for HMM training
-OOS window: 126 trading days (6 months) for evaluation
-Step size:  126 trading days (6 months)
+Allocation-only: no per-fill inventory accounting beyond one symbol. Default windows are
+252 train bars, 126 OOS bars, step 126. Rebalances when strategy targets diverge from the
+deadband, with optional fill delay and slippage at the next open.
 """
 
 import logging
-from dataclasses import dataclass, field
-from typing import List, Dict, Optional, Tuple
+from typing import List
 
-import numpy as np
 import pandas as pd
 
-from core.hmm_engine import HMMEngine
-from core.regime_strategies import StrategyOrchestrator
+from backtest.delayed_rebalance import delayed_rebalance_trade
+from backtest.result import BacktestResult
+from backtest.trade import Trade
+from backtest.walk_sim_state import WalkSimState
+from core.hmm.engine import HMMEngine
+from core.strategies.orchestrator import StrategyOrchestrator
 
 logger = logging.getLogger(__name__)
 
 
-@dataclass
-class Trade:
-    """Records a single allocation rebalance event during backtesting."""
-
-    bar_index: int
-    timestamp: pd.Timestamp
-    symbol: str
-    prev_allocation: float
-    new_allocation: float
-    price: float
-    regime: str
-    regime_prob: float
-    slippage_cost: float
-
-
-def _delayed_rebalance_trade(
-    *,
-    symbol: str,
-    bars: pd.DataFrame,
-    global_idx: int,
-    fill_delay: int,
-    total_bars: int,
-    equity: float,
-    cash: float,
-    shares: float,
-    prev_allocation: float,
-    target_allocation: float,
-    slippage_pct: float,
-    regime_state,
-) -> Tuple[float, float, float, Optional[Trade]]:
-    """
-    Apply allocation change with fill_delay using next bar's open + slippage.
-
-    Returns (cash, shares, allocation_after, trade_or_none). Allocation unchanged if no fill.
-    """
-    fill_idx = global_idx + fill_delay
-    if fill_idx >= total_bars:
-        return cash, shares, prev_allocation, None
-
-    fill_price = float(bars.iloc[fill_idx]["open"])
-    slip = fill_price * slippage_pct
-    fill_price += slip
-
-    target_shares = int(equity * target_allocation / fill_price)
-    delta = target_shares - shares
-    cost = delta * fill_price
-    slippage_cost = abs(delta) * slippage
-
-    new_cash = cash - cost
-    new_shares = float(target_shares)
-    trade = Trade(
-        bar_index=fill_idx,
-        timestamp=bars.index[fill_idx],
-        symbol=symbol,
-        prev_allocation=prev_allocation,
-        new_allocation=target_allocation,
-        price=fill_price,
-        regime=regime_state.label,
-        regime_prob=regime_state.probability,
-        slippage_cost=slippage_cost,
-    )
-    return new_cash, new_shares, target_allocation, trade
-
-
-@dataclass
-class BacktestResult:
-    """Aggregated output from a completed walk-forward backtest run."""
-
-    equity_curve: pd.Series
-    trade_log: List[Trade]
-    regime_history: pd.DataFrame
-    windows: List[Dict]
-    config: Dict
-
-
-@dataclass
-class _WalkSimState:
-    """Mutable cash / shares / allocation while walking OOS bars."""
-
-    cash: float
-    shares: float
-    current_allocation: float
-
-
 class WalkForwardBacktester:
-    """Runs an allocation-based walk-forward backtest using HMM regime detection."""
+    """Rolling IS train + OOS simulation for one ticker."""
 
-    def __init__(self, config: dict):
-        """
-        Initialize the backtester with the full application config.
+    def __init__(self, config: dict) -> None:
+        """Parse ``backtest`` settings from the full application config.
 
         Args:
-            config: Dict containing 'backtest', 'hmm', and 'strategy' sub-configs.
+            config: Must include ``backtest``, ``hmm``, and ``strategy`` sections.
         """
         self.cfg = config
         self.bt_cfg = config.get("backtest", {})
@@ -133,12 +45,16 @@ class WalkForwardBacktester:
         fill_delay: int,
         slippage_pct: float,
         total_bars: int,
-        walk: _WalkSimState,
+        walk: WalkSimState,
         all_equity: pd.Series,
         trade_log: List[Trade],
         regime_rows: list,
     ) -> int:
-        """One OOS window: update equity path, regime rows, and trades. Returns trade count."""
+        """Walk one OOS slice; mutate ``walk``, ``all_equity``, and logs in place.
+
+        Returns:
+            Number of rebalance trades executed in this window.
+        """
         window_trades = 0
         for i in range(len(oos_bars)):
             global_idx = oos_start + i
@@ -178,7 +94,7 @@ class WalkForwardBacktester:
             if abs(target - walk.current_allocation) < rebalance_threshold:
                 continue
 
-            ncash, nshares, nalloc, trade = _delayed_rebalance_trade(
+            ncash, nshares, nalloc, trade = delayed_rebalance_trade(
                 symbol=symbol,
                 bars=bars,
                 global_idx=global_idx,
@@ -204,9 +120,17 @@ class WalkForwardBacktester:
         symbol: str,
         bars: pd.DataFrame,
     ) -> BacktestResult:
-        """
-        Run walk-forward backtest on a single symbol.
-        bars: DataFrame with OHLCV columns, DatetimeIndex.
+        """Execute rolling windows on ``bars`` for ``symbol``.
+
+        Args:
+            symbol: Ticker to simulate.
+            bars: OHLCV DataFrame with a DatetimeIndex; columns are lowercased internally.
+
+        Returns:
+            :class:`BacktestResult` with curves, trades, regime history, and window stats.
+
+        Raises:
+            ValueError: If ``len(bars)`` is shorter than train + test requirements.
         """
         bars = bars.copy()
         bars.columns = [c.lower() for c in bars.columns]
@@ -226,7 +150,7 @@ class WalkForwardBacktester:
                 f"Need at least {min_start + test_window} bars, got {total_bars}."
             )
 
-        walk = _WalkSimState(
+        walk = WalkSimState(
             cash=initial_capital,
             shares=0.0,
             current_allocation=0.0,

@@ -1,8 +1,4 @@
-"""
-Alert system for critical trading events.
-Rate-limited: 1 alert per event type per 15 minutes.
-Delivery: console, log file, optional email, optional webhook.
-"""
+"""Rate-limited alerts (log + optional webhook/email) for operational incidents."""
 
 import logging
 import os
@@ -12,15 +8,14 @@ logger = logging.getLogger("alerts")
 
 
 class AlertManager:
-    """Dispatches rate-limited alerts for critical trading events via log, webhook, and email."""
+    """Debounce duplicate ``event_type`` keys then fan out to configured sinks."""
 
-    def __init__(self, config: dict):
-        """Initialize the alert manager with rate-limit settings and optional delivery targets.
+    def __init__(self, config: dict) -> None:
+        """Load rate-limit minutes plus optional email/webhook targets.
 
         Args:
-            config: Full application config dict; reads monitoring.alert_rate_limit_minutes,
-                    alerts.email, and alerts.webhook_url. Environment variables
-                    ALERT_EMAIL and ALERT_WEBHOOK_URL override config values.
+            config: Uses ``monitoring.alert_rate_limit_minutes`` and ``alerts.*`` keys.
+                ``ALERT_EMAIL`` / ``ALERT_WEBHOOK_URL`` env vars override file settings.
         """
         self.cfg = config
         self.rate_limit_secs = config.get("monitoring", {}).get("alert_rate_limit_minutes", 15) * 60
@@ -29,7 +24,7 @@ class AlertManager:
         self._webhook = os.getenv("ALERT_WEBHOOK_URL") or config.get("alerts", {}).get("webhook_url", "")
 
     def send(self, event_type: str, message: str) -> None:
-        """Log and optionally webhook/email; no-op if ``event_type`` was sent inside the rate-limit window."""
+        """Emit ``message`` unless ``event_type`` is still inside the cooldown window."""
         now = time.time()
         last = self._last_sent.get(event_type, 0)
         if now - last < self.rate_limit_secs:

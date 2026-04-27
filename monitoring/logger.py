@@ -1,8 +1,4 @@
-"""
-Structured JSON logging with rotating files.
-Files: main.log, trades.log, alerts.log, regime.log
-Each entry includes: timestamp, regime, probability, equity, positions, daily_pnl
-"""
+"""Rotating JSON log handlers plus ``setup_structured_logging`` for the app."""
 
 import json
 import logging
@@ -13,15 +9,10 @@ from core.timeutil import utc_now
 
 
 class StructuredFormatter(logging.Formatter):
-    """Logging formatter that serialises each log record as a JSON object."""
+    """Emit one JSON object per log record (UTC timestamp, level, extras)."""
 
     def format(self, record: logging.LogRecord) -> str:
-        """Serialize a log record to a JSON string.
-
-        Always includes timestamp, level, logger name, and message.
-        Appends optional trading fields (regime, probability, equity, positions,
-        daily_pnl) when present on the record, plus exception info if applicable.
-        """
+        """Map ``record`` fields into a stable JSON dict for log aggregation."""
         doc = {
             "timestamp": utc_now().isoformat(),
             "level": record.levelname,

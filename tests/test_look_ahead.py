@@ -1,12 +1,11 @@
-"""
-MANDATORY: Verify no look-ahead bias in regime predictions.
+"""Look-ahead regression tests for HMM filtering and walk-forward overlap invariance.
 
-The forward algorithm must produce identical regime predictions at any time T
-regardless of how much data exists AFTER T.
+Invariant: filtered state at calendar date ``T`` must not change when future bars exist only
+beyond ``T`` (same prefix vs extended history). If this fails, backtests are invalid.
 
-  regime at bar 400 using data[0:400] == regime at bar 400 using data[0:500]
+Example check::
 
-If this fails, look-ahead bias is present and backtests are invalid.
+    regime at bar 400 using data[0:400] == regime at bar 400 using data[0:500]
 """
 
 import os
@@ -19,7 +18,15 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
 def _make_synthetic_bars(n: int = 1000, seed: int = 42) -> pd.DataFrame:
-    """Generate synthetic OHLCV bars with alternating volatility regimes for look-ahead tests."""
+    """Two-regime vol synthetic series for causal checks.
+
+    Args:
+        n: Length in business days.
+        seed: RNG seed.
+
+    Returns:
+        OHLCV DataFrame.
+    """
     rng = np.random.default_rng(seed)
     prices = [100.0]
     for i in range(n - 1):
@@ -38,7 +45,11 @@ def _make_synthetic_bars(n: int = 1000, seed: int = 42) -> pd.DataFrame:
 
 
 def _load_config():
-    """Load the project settings.yaml config and return it as a dict."""
+    """Load ``config/settings.yaml``.
+
+    Returns:
+        Parsed settings dict.
+    """
     import yaml
     cfg_path = os.path.join(os.path.dirname(__file__), "..", "config", "settings.yaml")
     with open(cfg_path) as f:
@@ -46,12 +57,8 @@ def _load_config():
 
 
 def test_no_look_ahead_bias():
-    """
-    Posterior at the same calendar date must match when using a prefix vs a longer series.
-    Compares the forward pass at the last valid date of the short prefix, not the last bar
-    of the long window (which would be a different time step).
-    """
-    from core.hmm_engine import HMMEngine
+    """Argmax state at shared last valid feature date matches short vs long prefixes."""
+    from core.hmm import HMMEngine
     from data.feature_engineering import get_feature_matrix
 
     config = _load_config()
@@ -91,8 +98,8 @@ def test_no_look_ahead_bias():
 
 
 def test_proba_sum_unchanged_by_future_data():
-    """Last-step regime probabilities must be a proper distribution (sum to 1)."""
-    from core.hmm_engine import HMMEngine
+    """Probability vector on prefix remains normalized (sanity on forward pass)."""
+    from core.hmm import HMMEngine
 
     config = _load_config()
     full_data = _make_synthetic_bars()
@@ -106,11 +113,8 @@ def test_proba_sum_unchanged_by_future_data():
 
 
 def test_backtest_end_date_invariance():
-    """
-    Backtest results at a given date should not change based on how far in the future we go.
-    Identical OOS periods should produce identical results regardless of test end date.
-    """
-    from backtest.backtester import WalkForwardBacktester
+    """Overlapping equity paths from two run lengths should match on shared index."""
+    from backtest import WalkForwardBacktester
 
     config = _load_config()
     full_data = _make_synthetic_bars()

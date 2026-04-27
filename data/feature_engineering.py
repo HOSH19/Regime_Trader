@@ -1,7 +1,6 @@
-"""
-Pure functions for computing HMM observable features from OHLCV data.
-All features use only past/present data — no look-ahead.
-All features are standardized with 252-period rolling z-scores.
+"""Causal OHLCV features and rolling z-scores for :class:`~core.hmm.engine.HMMEngine`.
+
+Every series uses information available at or before each bar; default z-score window is 252 sessions.
 """
 
 from typing import Tuple
@@ -128,10 +127,14 @@ def rolling_zscore(series: pd.Series, window: int = 252) -> pd.Series:
 
 
 def compute_features(bars: pd.DataFrame, zscore_window: int = 252) -> pd.DataFrame:
-    """
-    Compute all HMM input features from OHLCV bars.
-    bars must have columns: open, high, low, close, volume (case-insensitive).
-    Returns a DataFrame of standardized features (rows may contain NaN until warmup).
+    """Build the full feature matrix (z-scored columns) from OHLCV ``bars``.
+
+    Args:
+        bars: Must expose ``open``, ``high``, ``low``, ``close``, ``volume`` (any case).
+        zscore_window: Rolling window for standardization (default 252).
+
+    Returns:
+        Feature frame aligned to ``bars.index``; warm-up rows remain ``NaN`` until populated.
     """
     bars = bars.copy()
     bars.columns = [c.lower() for c in bars.columns]
@@ -171,7 +174,11 @@ def compute_features(bars: pd.DataFrame, zscore_window: int = 252) -> pd.DataFra
 def get_feature_matrix(
     bars: pd.DataFrame, zscore_window: int = 252
 ) -> Tuple[np.ndarray, pd.Index]:
-    """Stack feature rows with NaNs dropped; return values and their original bar index."""
+    """Return ``compute_features`` rows with complete cases only.
+
+    Returns:
+        ``(values, index)`` where ``values`` is ``float64`` ndarray suitable for ``hmmlearn``.
+    """
     features = compute_features(bars, zscore_window)
     valid = features.dropna()
     return valid.values, valid.index

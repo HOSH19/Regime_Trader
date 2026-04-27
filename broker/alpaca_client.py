@@ -1,6 +1,6 @@
-"""
-Alpaca API wrapper. Credentials from .env (NEVER hardcoded).
-Paper trading by default. Live requires explicit typed confirmation.
+"""Thin Alpaca SDK bootstrap: env credentials, paper/live base URLs, client wiring.
+
+Never embed secrets in code; load keys from ``.env`` or config for local dev only.
 """
 
 import logging
@@ -19,14 +19,13 @@ LIVE_BASE_URL = "https://api.alpaca.markets"
 
 
 class AlpacaClient:
-    """Thin wrapper around the Alpaca SDK with paper/live mode switching and auto-reconnect."""
+    """Trading + historical data clients with paper/live selection."""
 
-    def __init__(self, config: dict):
-        """
-        Initialize AlpacaClient and immediately establish a connection.
+    def __init__(self, config: dict) -> None:
+        """Build SDK clients from ``config`` and environment variables.
 
         Args:
-            config: Application config dict with 'broker' and 'alpaca' sub-keys.
+            config: Includes ``broker.paper_trading`` and optional ``alpaca`` key overrides.
         """
         self.cfg = config
         self.paper_trading = config.get("broker", {}).get("paper_trading", True)
@@ -34,8 +33,8 @@ class AlpacaClient:
         self._data_client = None
         self._connect()
 
-    def _connect(self):
-        """Instantiate Alpaca trading and data clients using credentials from env or config."""
+    def _connect(self) -> None:
+        """Construct ``TradingClient`` and ``StockHistoricalDataClient`` if keys exist."""
         from alpaca.trading.client import TradingClient
         from alpaca.data.historical import StockHistoricalDataClient
 

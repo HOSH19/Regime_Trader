@@ -1,14 +1,13 @@
-"""
-Regime Trader — Entry Point.
+"""Regime Trader CLI: live loop, backtest, stress tests, training, and dashboard modes.
 
 Usage:
-  python main.py                        # Live/paper trading loop
-  python main.py --dry-run              # Full pipeline, no orders placed
-  python main.py --backtest --symbols SPY --start 2019-01-01 --end 2024-12-31
-  python main.py --backtest --compare   # With benchmark comparisons
-  python main.py --stress-test --symbols SPY --start 2019-01-01 --end 2024-12-31
-  python main.py --train-only           # Train HMM and exit
-  python main.py --dashboard            # Show dashboard for running instance
+    python main.py                        # Live/paper trading loop
+    python main.py --dry-run              # Full pipeline, no orders placed
+    python main.py --backtest --symbols SPY --start 2019-01-01 --end 2024-12-31
+    python main.py --backtest --compare   # With benchmark comparisons
+    python main.py --stress-test --symbols SPY --start 2019-01-01 --end 2024-12-31
+    python main.py --train-only           # Train HMM and exit
+    python main.py --dashboard            # Show dashboard for running instance
 """
 
 import argparse
@@ -40,14 +39,14 @@ LOG_DIR = os.path.join(BASE_DIR, "logs")
 
 
 def load_config() -> dict:
-    """Load and return the YAML application config from config/settings.yaml."""
+    """Parse ``config/settings.yaml`` relative to the package root."""
     cfg_path = os.path.join(BASE_DIR, "config", "settings.yaml")
     with open(cfg_path) as f:
         return yaml.safe_load(f)
 
 
-def setup_logging(config: dict):
-    """Initialize structured logging using settings from the application config."""
+def setup_logging(config: dict) -> None:
+    """Configure rotating JSON logs via ``monitoring.logger``."""
     os.makedirs(LOG_DIR, exist_ok=True)
     from monitoring.logger import setup_structured_logging
     setup_structured_logging(config)
@@ -61,7 +60,7 @@ def load_or_train_hmm(config: dict, market_data, symbols: list):
     fetches ~3 years of bars for the primary symbol and trains a new model, saving it.
     Staleness is decided only by training age, not by whether the exchange is open.
     """
-    from core.hmm_engine import HMMEngine
+    from core.hmm import HMMEngine
 
     hmm = HMMEngine(config.get("hmm", {}))
     primary_symbol = symbols[0]
@@ -207,8 +206,8 @@ def run_trading_loop(config: dict, dry_run: bool = False):
     from broker.alpaca_client import AlpacaClient
     from broker.order_executor import OrderExecutor
     from broker.position_tracker import PositionTracker
-    from core.regime_strategies import StrategyOrchestrator
-    from core.risk_manager import PortfolioState, RiskManager
+from core.strategies import StrategyOrchestrator
+from core.risk import PortfolioState, RiskManager
     from core.signal_generator import SignalGenerator
     from data.market_data import MarketData
     from monitoring.alerts import AlertManager
@@ -330,7 +329,7 @@ def run_backtest(config: dict, args):
         args: Parsed argparse namespace with symbols, start, end, stress_test, and compare flags.
     """
     from broker.alpaca_client import AlpacaClient
-    from backtest.backtester import WalkForwardBacktester
+    from backtest import WalkForwardBacktester
     from backtest.performance import print_report
     from backtest.stress_test import run_crash_injection, run_gap_risk, run_regime_misclassification, print_stress_report
     from data.market_data import MarketData

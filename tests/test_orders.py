@@ -1,6 +1,4 @@
-"""
-Tests for order executor in dry-run mode (no real API calls).
-"""
+"""Tests for :class:`~broker.order_executor.OrderExecutor` in ``dry_run`` (no broker I/O)."""
 
 import os
 import sys
@@ -8,16 +6,23 @@ import pytest
 from datetime import datetime
 from unittest.mock import MagicMock, patch
 
-import numpy as np
-
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from core.timeutil import utc_now
 
 
 def _make_signal(symbol="SPY", entry=400.0, stop=390.0):
-    """Build a LONG Signal fixture with 20% allocation, 1.0× leverage, and the given entry/stop prices."""
-    from core.regime_strategies import Signal
+    """Long signal with 20% allocation and 1.0× leverage.
+
+    Args:
+        symbol: Ticker.
+        entry: Reference price.
+        stop: Protective stop below entry.
+
+    Returns:
+        :class:`~core.strategies.signal.Signal` fixture.
+    """
+    from core.strategies import Signal
     return Signal(
         symbol=symbol, direction="LONG", confidence=0.75,
         entry_price=entry, stop_loss=stop, take_profit=None,
@@ -28,13 +33,13 @@ def _make_signal(symbol="SPY", entry=400.0, stop=390.0):
 
 
 def _make_risk_decision(signal):
-    """Wrap a signal in an approved RiskDecision fixture."""
-    from core.risk_manager import RiskDecision
+    """Approved :class:`~core.risk.risk_decision.RiskDecision` wrapping ``signal``."""
+    from core.risk import RiskDecision
     return RiskDecision(approved=True, modified_signal=signal, rejection_reason="")
 
 
 def _mock_alpaca():
-    """Return a MagicMock Alpaca client whose get_account().equity is $100,000."""
+    """``MagicMock`` client with ``get_account().equity == "100000"``."""
     client = MagicMock()
     account = MagicMock()
     account.equity = "100000"
@@ -43,10 +48,10 @@ def _mock_alpaca():
 
 
 class TestOrderExecutorDryRun:
-    """Tests for OrderExecutor operating in dry-run mode; no real API calls are made."""
+    """Sizing and guard rails without ``trading_client`` side effects."""
 
     def test_dry_run_submit_returns_trade_id(self):
-        """submit_order in dry-run mode must return a non-None trade ID that includes the ticker symbol."""
+        """``submit_order`` returns a symbol-prefixed synthetic id."""
         from broker.order_executor import OrderExecutor
         client = _mock_alpaca()
         executor = OrderExecutor(client, dry_run=True)
@@ -57,9 +62,9 @@ class TestOrderExecutorDryRun:
         assert "SPY" in order_id
 
     def test_rejected_signal_not_submitted(self):
-        """submit_order must return None and skip execution when the RiskDecision is not approved."""
+        """Unapproved decision yields ``None``."""
         from broker.order_executor import OrderExecutor
-        from core.risk_manager import RiskDecision
+        from core.risk import RiskDecision
         client = _mock_alpaca()
         executor = OrderExecutor(client, dry_run=True)
         signal = _make_signal()
@@ -68,7 +73,7 @@ class TestOrderExecutorDryRun:
         assert order_id is None
 
     def test_modify_stop_only_tightens(self):
-        """modify_stop must reject a new stop that is below (looser than) the current stop."""
+        """Loosening stop returns ``False``."""
         from broker.order_executor import OrderExecutor
         client = _mock_alpaca()
         executor = OrderExecutor(client, dry_run=True)
@@ -76,7 +81,7 @@ class TestOrderExecutorDryRun:
         assert result is False
 
     def test_modify_stop_tighter_accepted(self):
-        """modify_stop must accept a new stop that is above (tighter than) the current stop."""
+        """Tightening stop returns ``True`` in dry-run."""
         from broker.order_executor import OrderExecutor
         client = _mock_alpaca()
         executor = OrderExecutor(client, dry_run=True)
@@ -84,7 +89,7 @@ class TestOrderExecutorDryRun:
         assert result is True
 
     def test_close_all_dry_run(self):
-        """close_all_positions in dry-run mode must return True without calling the real API."""
+        """``close_all_positions`` short-circuits without SDK call."""
         from broker.order_executor import OrderExecutor
         client = _mock_alpaca()
         executor = OrderExecutor(client, dry_run=True)
@@ -93,7 +98,7 @@ class TestOrderExecutorDryRun:
         client.trading_client.close_all_positions.assert_not_called()
 
     def test_trade_id_is_unique(self):
-        """Each successive submit_order call must produce a distinct trade ID."""
+        """Each dry-run submit gets a distinct client order id prefix body."""
         from broker.order_executor import OrderExecutor
         client = _mock_alpaca()
         executor = OrderExecutor(client, dry_run=True)
@@ -106,9 +111,9 @@ class TestOrderExecutorDryRun:
         assert len(ids) == 10, "trade_ids should be unique"
 
     def test_bracket_order_dry_run(self):
-        """submit_bracket_order in dry-run mode must return a non-None order ID for a signal with a take-profit."""
+        """Bracket path returns non-null id when TP is set."""
         from broker.order_executor import OrderExecutor
-        from core.regime_strategies import Signal
+        from core.strategies import Signal
         client = _mock_alpaca()
         executor = OrderExecutor(client, dry_run=True)
         signal = Signal(

@@ -30,7 +30,7 @@ Rows with any missing feature (warm-up) are dropped before training or inference
 
 ## Regime detection (HMM)
 
-Implemented in `core/hmm_engine.py`:
+Implemented in `core/hmm/`:
 
 - **Model:** `hmmlearn` Gaussian HMM, full covariance, multiple random inits (`n_init`), BIC-driven choice of **3–7** hidden states (`n_candidates`).
 - **Live / sequential inference:** filtered state probabilities use a **manual forward algorithm** only. **Viterbi / `predict()` is not used** for real-time regime probabilities, avoiding smoothed (look-ahead) state paths on the streaming boundary.
@@ -43,7 +43,7 @@ Implemented in `core/hmm_engine.py`:
 
 ## Strategy layer
 
-Implemented in `core/regime_strategies.py` and driven by `config/settings.yaml` under `strategy`:
+Implemented in `core/strategies/` and driven by `config/settings.yaml` under `strategy`:
 
 - **Regime → handler:** each HMM state maps to a **low / mid / high volatility** strategy class according to that state’s volatility rank among all states.
 - **Allocation:** target long fraction of equity (and optional leverage on the calm tier) from configured floors/ceilings; **mid-vol** tier can distinguish trend vs range using price vs SMA200.
@@ -57,7 +57,7 @@ Implemented in `core/regime_strategies.py` and driven by `config/settings.yaml` 
 
 ## Risk layer
 
-Implemented in `core/risk_manager.py` and applied before any order reaches the broker:
+Implemented in `core/risk/` and applied before any order reaches the broker:
 
 - **Circuit breaker:** hierarchical actions from intraday / weekly drawdown soft thresholds through **hard halt** from peak drawdown; extreme peak breach can write a **lock file** requiring manual removal.
 - **Per-trade sizing:** risk budget per trade, **gap-risk multiplier** on stop distance for overnight-aware share counts, min notional, max single name, max gross exposure, max concurrent positions, leverage caps tightened when multiple positions or breaker soft states apply.
@@ -69,7 +69,7 @@ Risk checks are **independent of HMM correctness**: even with wrong regimes, dra
 
 ## Backtesting and evaluation
 
-- **`backtest/backtester.py`:** **walk-forward** runs: train HMM on an in-sample window (default 252 sessions), simulate out-of-sample (default 126), step the window forward. The simulator is **allocation-based** (target weights, rebalance when the deadband is crossed), not a full fill simulator for every tick.
+- **`backtest/walk_forward_backtester.py`:** **walk-forward** runs: train HMM on an in-sample window (default 252 sessions), simulate out-of-sample (default 126), step the window forward. The simulator is **allocation-based** (target weights, rebalance when the deadband is crossed), not a full fill simulator for every tick.
 - **Execution model:** signal at bar *t*, optional **fill delay** at bar *t+1* open plus **slippage**; equity path and a rebalance **trade log** are recorded together with **regime history**.
 - **`backtest/performance.py`:** returns, drawdown, Sharpe/Sortino/Calmar, trade statistics, buy-and-hold / SMA(200) / random-allocation benchmarks, Rich report output.
 - **`backtest/stress_test.py`:** Monte Carlo **crash gaps** (multiplicative shocks), **ATR-scaled overnight gaps**, and **shuffled close paths** to stress drawdowns and dependence on regime ordering.

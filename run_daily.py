@@ -1,17 +1,8 @@
-"""
-Daily cron entry point for Regime Trader.
+"""Cron-friendly entrypoint: market-open trading path vs closed-session summary.
 
-Run this via cron OR manually at any time.
+Typical cron (21:05 UTC daily)::
 
-Behavior:
-  - Market OPEN / weekday after close  → full pipeline: analyze, generate signals, place orders, briefing
-  - Market CLOSED (weekend/holiday)    → analysis only: regime + stock prices, no orders, summary to Telegram
-
-Cron schedule (runs at ~4:05 PM ET = 21:05 UTC, every day including weekends):
-  5 21 * * * /path/to/venv/bin/python /path/to/regime-trader/run_daily.py
-
-Run manually any time (e.g. on a weekend for a quick status check):
-  python run_daily.py
+    5 21 * * * /path/to/venv/bin/python /path/to/regime-trader/run_daily.py
 """
 
 import json
@@ -37,20 +28,20 @@ LOG_DIR = os.path.join(BASE_DIR, "logs")
 
 
 def load_config() -> dict:
-    """Load and return the YAML settings from config/settings.yaml."""
+    """Parse ``config/settings.yaml`` next to this file."""
     with open(os.path.join(BASE_DIR, "config", "settings.yaml")) as f:
         return yaml.safe_load(f)
 
 
-def setup_logging(config: dict):
-    """Initialize structured logging using the application config."""
+def setup_logging(config: dict) -> None:
+    """Ensure ``logs/`` exists and install structured handlers."""
     os.makedirs(LOG_DIR, exist_ok=True)
     from monitoring.logger import setup_structured_logging
     setup_structured_logging(config)
 
 
 def _load_prev_snapshot() -> dict:
-    """Load the last persisted state snapshot from disk, returning empty dict on failure."""
+    """Return ``state_snapshot.json`` contents or ``{}`` if missing/unreadable."""
     if os.path.exists(STATE_SNAPSHOT_FILE):
         try:
             with open(STATE_SNAPSHOT_FILE) as f:
@@ -60,13 +51,13 @@ def _load_prev_snapshot() -> dict:
     return {}
 
 
-def _save_snapshot(portfolio, regime_state, prev_snapshot: dict):
-    """
-    Persist portfolio and regime state to disk as a JSON snapshot.
+def _save_snapshot(portfolio, regime_state, prev_snapshot: dict) -> None:
+    """Write ``STATE_SNAPSHOT_FILE`` with equity, regime summary, and session anchors.
 
-    Carries forward daily_start_equity and weekly_start_equity from the previous
-    snapshot when they are not yet reset. (Peak drawdown is not tracked here —
-    avoids brittle state across CI runners.)
+    Args:
+        portfolio: Live ``PortfolioState`` snapshot.
+        regime_state: Latest filtered regime (may be ``None`` in edge cases).
+        prev_snapshot: Ignored by the current implementation (kept for call-site compatibility).
     """
     snapshot = {
         "timestamp": utc_now().isoformat(),
@@ -83,10 +74,10 @@ def _save_snapshot(portfolio, regime_state, prev_snapshot: dict):
 
 
 def _fetch_bars(market_data, symbols, timeframe, logger):
-    """
-    Fetch ~10 years of historical OHLCV bars for each symbol.
+    """Download ~10y of daily bars per symbol for HMM refresh.
 
-    Returns a dict mapping symbol -> DataFrame. Symbols with no data are skipped.
+    Returns:
+        Mapping of ticker → OHLCV ``DataFrame``; omits symbols that return empty frames.
     """
     bars_by_symbol = {}
     for sym in symbols:
@@ -103,14 +94,11 @@ def _fetch_bars(market_data, symbols, timeframe, logger):
 
 
 def _load_or_train_hmm(config, primary_bars, logger):
-    """
-    Load the saved HMM model or train a new one if absent or stale.
+    """Load ``hmm_model.pkl`` or fit/save when missing or older than ``stale_max_days``.
 
-    Retrains whenever the on-disk model is older than hmm.stale_max_days (see settings).
-    This runs on every invocation — including when the market is closed — and does not
-    depend on Alpaca's market-open flag.
+    Runs regardless of session clock so weekend cron still refreshes the model.
     """
-    from core.hmm_engine import HMMEngine
+    from core.hmm import HMMEngine
     hmm = HMMEngine(config.get("hmm", {}))
     stale_max = int(config.get("hmm", {}).get("stale_max_days", 3))
 
@@ -154,7 +142,7 @@ def _session_from_clock(clock):
 def _portfolio_and_positions(alpaca, prev_snapshot: dict):
     """Sync Alpaca account into a ``PortfolioState`` and build Telegram position rows."""
     from broker.position_tracker import PositionTracker
-    from core.risk_manager import PortfolioState
+    from core.risk import PortfolioState
 
     account = alpaca.get_account()
     equity = float(account.equity)
@@ -265,19 +253,8 @@ def _send_open_market_briefing(
         )
 
 
-def run():
-    """
-    Execute the daily trading pipeline.
-
-    HMM load/retrain (when the saved model is missing or stale) always runs first, even on
-    weekends or holidays, so the regime snapshot stays current.
-
-    When the market is open, runs the full pipeline: regime detection, signal generation,
-    risk checks, order placement, and Telegram briefing.
-
-    When the market is closed (weekend, holiday, or after hours), sends a summary-only
-    Telegram message with regime and portfolio status and skips all order placement.
-    """
+def run() -> None:
+    """Cron/manual pipeline: refresh HMM, then trade if the session is open else notify only."""
     config = load_config()
     setup_logging(config)
     logger = logging.getLogger(__name__)
@@ -288,8 +265,8 @@ def run():
 
     from broker.alpaca_client import AlpacaClient
     from broker.order_executor import OrderExecutor
-    from core.regime_strategies import StrategyOrchestrator
-    from core.risk_manager import RiskManager
+    from core.strategies import StrategyOrchestrator
+    from core.risk import RiskManager
     from core.signal_generator import SignalGenerator
     from data.market_data import MarketData
     from data.news_fetcher import fetch_news_for_symbols

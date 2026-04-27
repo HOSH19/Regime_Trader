@@ -1,36 +1,35 @@
-"""
-Track open positions, P&L, and sync with Alpaca on startup.
-Updates PortfolioState and CircuitBreaker on every fill via WebSocket.
+"""Alpaca-backed position sync and optional streaming fill handling.
+
+Mutates a shared :class:`~core.risk.portfolio_state.PortfolioState` on startup and fills.
 """
 
 import logging
 import threading
 from typing import Dict, Optional
 
-from core.risk_manager import PortfolioState, Position
+from core.risk import PortfolioState, Position
 from core.timeutil import utc_now
 
 logger = logging.getLogger(__name__)
 
 
 class PositionTracker:
-    """Keeps PortfolioState in sync with Alpaca and processes order fills."""
+    """Reconcile broker positions into an in-memory ``PortfolioState``."""
 
-    def __init__(self, alpaca_client, portfolio_state: PortfolioState):
-        """
-        Initialize PositionTracker.
+    def __init__(self, alpaca_client, portfolio_state: PortfolioState) -> None:
+        """Share one ``PortfolioState`` instance with the rest of the app.
 
         Args:
-            alpaca_client: Connected AlpacaClient instance.
-            portfolio_state: Shared PortfolioState object mutated in place.
+            alpaca_client: Connected ``AlpacaClient``.
+            portfolio_state: Object updated by :meth:`sync_from_alpaca` and stream handlers.
         """
         self.client = alpaca_client
         self.portfolio = portfolio_state
         self._lock = threading.Lock()
         self._ws_thread: Optional[threading.Thread] = None
 
-    def sync_from_alpaca(self):
-        """Reconcile tracked positions with actual Alpaca positions on startup."""
+    def sync_from_alpaca(self) -> None:
+        """Pull account and open lots from Alpaca into ``portfolio``."""
         try:
             account = self.client.get_account()
             self.portfolio.equity = float(account.equity)

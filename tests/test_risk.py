@@ -1,7 +1,4 @@
-"""
-Tests for the risk management layer.
-Circuit breakers, position sizing, leverage rules, order validation.
-"""
+"""Tests for ``core.risk``: circuit breakers, sizing, leverage, and signal validation."""
 
 import os
 import sys
@@ -16,7 +13,11 @@ from core.timeutil import utc_now
 
 
 def _load_config():
-    """Load the project settings.yaml config and return it as a dict."""
+    """Load ``config/settings.yaml`` from the repo root.
+
+    Returns:
+        Parsed settings dict.
+    """
     import yaml
     cfg_path = os.path.join(os.path.dirname(__file__), "..", "config", "settings.yaml")
     with open(cfg_path) as f:
@@ -24,13 +25,17 @@ def _load_config():
 
 
 def _make_portfolio(equity: float = 100_000, daily_dd: float = 0.0, peak_dd: float = 0.0):
-    """
-    Build a PortfolioState fixture.
+    """Build a :class:`~core.risk.portfolio_state.PortfolioState` with implied reference levels.
 
-    daily_dd and peak_dd are fractional drawdowns (e.g. -0.025 means -2.5%) used to
-    back-calculate the reference equity levels that the circuit-breaker compares against.
+    Args:
+        equity: Mark-to-market equity.
+        daily_dd: Fractional daily drawdown (e.g. ``-0.025`` → −2.5%) vs day-open.
+        peak_dd: Fractional drawdown vs peak (e.g. ``-0.12`` → −12%).
+
+    Returns:
+        Portfolio snapshot for breaker tests.
     """
-    from core.risk_manager import PortfolioState
+    from core.risk import PortfolioState
     portfolio = PortfolioState(equity=equity, cash=equity, buying_power=equity)
     portfolio.daily_start_equity = equity / (1 + daily_dd) if daily_dd != 0 else equity
     portfolio.peak_equity = equity / (1 + peak_dd) if peak_dd != 0 else equity
@@ -39,8 +44,19 @@ def _make_portfolio(equity: float = 100_000, daily_dd: float = 0.0, peak_dd: flo
 
 
 def _make_signal(symbol="SPY", alloc=0.95, lev=1.0, entry=400.0, stop=390.0):
-    """Build a LONG Signal fixture with the given symbol, allocation, leverage, entry, and stop-loss."""
-    from core.regime_strategies import Signal
+    """Construct an approved-style long :class:`~core.strategies.signal.Signal`.
+
+    Args:
+        symbol: Ticker.
+        alloc: Target fraction of equity.
+        lev: Leverage multiplier.
+        entry: Reference entry price.
+        stop: Protective stop (must be > 0 for approval tests).
+
+    Returns:
+        Signal fixture.
+    """
+    from core.strategies import Signal
     return Signal(
         symbol=symbol, direction="LONG", confidence=0.75,
         entry_price=entry, stop_loss=stop, take_profit=None,
@@ -51,11 +67,11 @@ def _make_signal(symbol="SPY", alloc=0.95, lev=1.0, entry=400.0, stop=390.0):
 
 
 class TestCircuitBreakers:
-    """Tests for the CircuitBreaker: daily drawdown thresholds, peak drawdown halting, and lock-file behaviour."""
+    """``CircuitBreaker.check`` thresholds: daily/weekly/peak paths and lock file."""
 
     def test_normal_state_passes(self):
-        """Portfolio within drawdown limits should receive NORMAL action from the circuit breaker."""
-        from core.risk_manager import CircuitBreaker
+        """Healthy portfolio yields ``NORMAL``."""
+        from core.risk import CircuitBreaker
         config = _load_config()
         cb = CircuitBreaker(config.get("risk", {}))
         portfolio = _make_portfolio()
@@ -63,8 +79,8 @@ class TestCircuitBreakers:
         assert action == "NORMAL"
 
     def test_daily_dd_reduce_threshold(self):
-        """A -2.5% daily drawdown must trigger the REDUCE_50_DAY action."""
-        from core.risk_manager import CircuitBreaker
+        """Daily DD past soft limit yields ``REDUCE_50_DAY``."""
+        from core.risk import CircuitBreaker
         config = _load_config()
         cb = CircuitBreaker(config.get("risk", {}))
         portfolio = _make_portfolio(equity=98_000, daily_dd=-0.025)
@@ -72,8 +88,8 @@ class TestCircuitBreakers:
         assert action == "REDUCE_50_DAY"
 
     def test_daily_dd_halt_threshold(self):
-        """A -3.5% daily drawdown must trigger the CLOSE_ALL_DAY action."""
-        from core.risk_manager import CircuitBreaker
+        """Daily DD past hard limit yields ``CLOSE_ALL_DAY``."""
+        from core.risk import CircuitBreaker
         config = _load_config()
         cb = CircuitBreaker(config.get("risk", {}))
         portfolio = _make_portfolio(equity=97_000, daily_dd=-0.035)
@@ -81,10 +97,12 @@ class TestCircuitBreakers:
         assert action == "CLOSE_ALL_DAY"
 
     def test_peak_dd_creates_lock_file(self, tmp_path, monkeypatch):
-        """A -12% peak drawdown must halt trading and write the lock file to disk."""
-        from core.risk_manager import CircuitBreaker
-        import core.risk_manager as rm
-        monkeypatch.setattr(rm, "TRADING_HALTED_LOCK", str(tmp_path / "trading_halted.lock"))
+        """Peak DD halt writes the lock file to the patched path."""
+        from core.risk import CircuitBreaker
+        monkeypatch.setattr(
+            "core.risk.constants.TRADING_HALTED_LOCK",
+            str(tmp_path / "trading_halted.lock"),
+        )
         config = _load_config()
         cb = CircuitBreaker(config.get("risk", {}))
         portfolio = _make_portfolio(equity=88_000, peak_dd=-0.12)
@@ -93,12 +111,11 @@ class TestCircuitBreakers:
         assert (tmp_path / "trading_halted.lock").exists()
 
     def test_lock_file_blocks_trading(self, tmp_path, monkeypatch):
-        """A pre-existing lock file must cause the circuit breaker to return HALTED even without a new drawdown."""
-        from core.risk_manager import CircuitBreaker
-        import core.risk_manager as rm
+        """Pre-existing lock forces ``HALTED`` without evaluating drawdowns."""
+        from core.risk import CircuitBreaker
         lock_path = tmp_path / "trading_halted.lock"
         lock_path.write_text("halted")
-        monkeypatch.setattr(rm, "TRADING_HALTED_LOCK", str(lock_path))
+        monkeypatch.setattr("core.risk.constants.TRADING_HALTED_LOCK", str(lock_path))
         config = _load_config()
         cb = CircuitBreaker(config.get("risk", {}))
         action, _ = cb.check(_make_portfolio())
@@ -106,11 +123,11 @@ class TestCircuitBreakers:
 
 
 class TestRiskManager:
-    """Tests for RiskManager signal validation: approval, rejection reasons, and position-size capping."""
+    """``RiskManager.validate_signal`` approval, rejects, and sizing side effects."""
 
     def test_valid_signal_approved(self):
-        """A well-formed signal against a healthy portfolio must be approved."""
-        from core.risk_manager import RiskManager
+        """Clean signal and portfolio result in ``approved``."""
+        from core.risk import RiskManager
         config = _load_config()
         rm = RiskManager(config)
         signal = _make_signal()
@@ -119,8 +136,8 @@ class TestRiskManager:
         assert decision.approved
 
     def test_missing_stop_rejected(self):
-        """A signal with a zero stop-loss must be rejected with a reason mentioning 'stop_loss'."""
-        from core.risk_manager import RiskManager
+        """Zero stop yields rejection mentioning ``stop_loss``."""
+        from core.risk import RiskManager
         config = _load_config()
         rm = RiskManager(config)
         signal = _make_signal(stop=0.0)
@@ -130,8 +147,8 @@ class TestRiskManager:
         assert "stop_loss" in decision.rejection_reason.lower()
 
     def test_max_concurrent_positions_blocks(self):
-        """Opening a new position when the max concurrent limit is already reached must be rejected."""
-        from core.risk_manager import RiskManager, Position
+        """At ``max_concurrent`` open names, a new symbol is rejected."""
+        from core.risk import RiskManager, Position
         config = _load_config()
         rm = RiskManager(config)
         portfolio = _make_portfolio()
@@ -147,10 +164,8 @@ class TestRiskManager:
         assert "concurrent" in decision.rejection_reason.lower()
 
     def test_leverage_forced_down_with_active_cb(self):
-        """When a circuit breaker is active, leverage on an approved signal must be reduced to 1.0."""
-        from core.risk_manager import RiskManager
-        import core.risk_manager as rm_module
-        import os
+        """Under hard daily halt path, approved flow must not keep leverage above 1.0."""
+        from core.risk import RiskManager
         config = _load_config()
         rm = RiskManager(config)
         portfolio = _make_portfolio(equity=97_000, daily_dd=-0.035)
@@ -160,8 +175,8 @@ class TestRiskManager:
             assert decision.modified_signal.leverage == 1.0
 
     def test_extreme_signal_size_capped(self):
-        """An oversized allocation must be capped to the configured max_single_position limit."""
-        from core.risk_manager import RiskManager
+        """Absurd ``position_size_pct`` is capped by ``max_single_position`` when approved."""
+        from core.risk import RiskManager
         config = _load_config()
         rm = RiskManager(config)
         signal = _make_signal(alloc=2.0, lev=1.25)
@@ -171,8 +186,8 @@ class TestRiskManager:
             assert decision.modified_signal.position_size_pct <= config["risk"]["max_single_position"]
 
     def test_daily_trade_limit(self):
-        """Exceeding the configured max_daily_trades count must cause the next signal to be rejected."""
-        from core.risk_manager import RiskManager
+        """Counter at ``max_daily_trades`` blocks further approvals."""
+        from core.risk import RiskManager
         config = _load_config()
         rm = RiskManager(config)
         rm._daily_trade_count = config["risk"]["max_daily_trades"]

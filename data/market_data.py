@@ -1,8 +1,4 @@
-"""
-Real-time and historical market data via Alpaca.
-WebSocket push for bar data — no polling.
-Handles gaps (weekends, holidays, halts) gracefully.
-"""
+"""Historical download + optional Alpaca streaming helpers with business-day gap repair."""
 
 import logging
 import threading
@@ -17,10 +13,14 @@ logger = logging.getLogger(__name__)
 
 
 class MarketData:
-    """Provides historical and real-time market data via the Alpaca API, including WebSocket bar streaming."""
+    """OHLCV fetch/cache façade over ``AlpacaClient.data_client``."""
 
-    def __init__(self, alpaca_client):
-        """Initialise with an AlpacaClient instance that exposes a `data_client` attribute."""
+    def __init__(self, alpaca_client) -> None:
+        """Store client reference and empty callback lists.
+
+        Args:
+            alpaca_client: Must expose a configured ``data_client`` for historical queries.
+        """
         self.client = alpaca_client
         self._bar_callbacks: List[Callable] = []
         self._quote_callbacks: List[Callable] = []
@@ -36,11 +36,10 @@ class MarketData:
         end: Optional[datetime] = None,
         limit: int = 2000,
     ) -> pd.DataFrame:
-        """
-        Fetch historical OHLCV bars for a symbol from Alpaca, with gap-filling applied.
+        """Download bars, normalize columns, and forward-fill session gaps.
 
-        Returns a DataFrame indexed by date with columns [open, high, low, close, volume],
-        or an empty DataFrame on failure.
+        Returns:
+            DataFrame indexed by business days with ``open|high|low|close|volume``, or empty on error.
         """
         from alpaca.data.requests import StockBarsRequest
         from alpaca.data.timeframe import TimeFrame
@@ -85,7 +84,7 @@ class MarketData:
             return pd.DataFrame()
 
     def _handle_gaps(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Forward-fill gaps from weekends/holidays/halts."""
+        """Reindex to business days and ffill OHLC; zero-fill missing volume."""
         if df.empty:
             return df
         if hasattr(df.index, "tz") and df.index.tz is not None:
@@ -102,7 +101,7 @@ class MarketData:
         return df.dropna(subset=["close"])
 
     def get_latest_bar(self, symbol: str) -> Optional[pd.Series]:
-        """Fetch the most recent OHLCV bar for a symbol; returns None on failure."""
+        """Return the latest daily bar as a ``Series``, or ``None`` if the SDK errors."""
         from alpaca.data.requests import StockLatestBarRequest
         from alpaca.data.enums import DataFeed
         try:
@@ -118,7 +117,7 @@ class MarketData:
             return None
 
     def get_latest_quote(self, symbol: str) -> Optional[dict]:
-        """Fetch the latest bid/ask quote for a symbol, including spread percentage; returns None on failure."""
+        """Bid/ask snapshot with ``spread_pct``, or ``None`` on failure."""
         from alpaca.data.requests import StockLatestQuoteRequest
         from alpaca.data.enums import DataFeed
         try:
@@ -131,7 +130,7 @@ class MarketData:
             return None
 
     def get_snapshot(self, symbol: str) -> Optional[dict]:
-        """Fetch the latest trade price and daily bar snapshot for a symbol; returns None on failure."""
+        """Combined latest trade + daily bar payload, or ``None`` on failure."""
         from alpaca.data.requests import StockSnapshotRequest
         from alpaca.data.enums import DataFeed
         try:
@@ -147,21 +146,17 @@ class MarketData:
             logger.error(f"get_snapshot({symbol}) failed: {e}")
             return None
 
-    def subscribe_bars(self, symbols: List[str], timeframe: str, callback: Callable):
-        """Subscribe to bar close events via WebSocket."""
+    def subscribe_bars(self, symbols: List[str], timeframe: str, callback: Callable) -> None:
+        """Register a bar callback and ensure the background stream is running."""
         self._bar_callbacks.append(callback)
         self._start_stream(symbols)
 
-    def subscribe_quotes(self, symbols: List[str], callback: Callable):
-        """Register a callback to be invoked on incoming quote updates for the given symbols."""
+    def subscribe_quotes(self, symbols: List[str], callback: Callable) -> None:
+        """Append a quote handler; starts the websocket worker if needed."""
         self._quote_callbacks.append(callback)
 
-    def _start_stream(self, symbols: List[str]):
-        """
-        Open a WebSocket connection for the given symbols and dispatch bar events to registered callbacks.
-
-        Runs the stream in a background daemon thread so it does not block the main process.
-        """
+    def _start_stream(self, symbols: List[str]) -> None:
+        """Spawn (or reuse) a daemon thread running ``StockDataStream`` for ``symbols``."""
         from alpaca.data.live import StockDataStream
         import os
 

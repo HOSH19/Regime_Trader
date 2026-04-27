@@ -1,6 +1,4 @@
-"""
-Stress testing: crash injection, gap risk, regime misclassification.
-"""
+"""Monte Carlo style shocks (gaps, shuffles) on top of :class:`~backtest.walk_forward_backtester.WalkForwardBacktester`."""
 
 import random
 from typing import Dict, List, Optional
@@ -8,12 +6,12 @@ from typing import Dict, List, Optional
 import numpy as np
 import pandas as pd
 
-from backtest.backtester import WalkForwardBacktester, BacktestResult
+from backtest import WalkForwardBacktester, BacktestResult
 from backtest.performance import compute_metrics
 
 
 def _primary_symbol(config: dict, override: Optional[str] = None) -> str:
-    """Ticker string for backtester runs (must match orchestrator symbol list)."""
+    """Resolve the primary symbol from ``config`` or ``override``."""
     if override:
         return override
     syms = config.get("broker", {}).get("symbols") or ["SPY"]

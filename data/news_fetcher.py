@@ -1,11 +1,6 @@
-"""
-NewsAPI integration — fetches the top 1 news article per stock ticker.
+"""NewsAPI.org client: one headline per configured ticker for Telegram briefings.
 
-Free tier: 100 requests/day, articles from past month.
-Get a free key at: https://newsapi.org/register
-
-Add to .env:
-  NEWSAPI_KEY=your_key_here
+Requires ``NEWSAPI_KEY`` in the environment (free tier: ~100 calls/day).
 """
 
 import logging

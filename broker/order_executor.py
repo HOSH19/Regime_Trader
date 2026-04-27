@@ -1,7 +1,6 @@
-"""
-Order placement, modification, and cancellation.
-LIMIT orders by default (±0.1% of price), cancel after 30s, optionally retry at market.
-Unique trade_id links signal → risk_decision → order → fill.
+"""Alpaca order execution: limit-first workflow, timeout cancel, optional market retry.
+
+Each flow uses a client-generated ``trade_id`` linking signal → risk decision → order → fill.
 """
 
 import logging
@@ -9,8 +8,8 @@ import time
 import uuid
 from typing import Optional
 
-from core.regime_strategies import Signal
-from core.risk_manager import RiskDecision
+from core.strategies import Signal
+from core.risk import RiskDecision
 
 logger = logging.getLogger(__name__)
 
@@ -19,22 +18,21 @@ ORDER_TIMEOUT_SECONDS = 30
 
 
 class OrderExecutor:
-    """Handles order submission, modification, and cancellation via Alpaca."""
+    """Submit, replace, and cancel orders through :class:`broker.alpaca_client.AlpacaClient`."""
 
-    def __init__(self, alpaca_client, dry_run: bool = False):
-        """
-        Initialize OrderExecutor.
+    def __init__(self, alpaca_client, dry_run: bool = False) -> None:
+        """Attach broker client and optional simulation mode.
 
         Args:
-            alpaca_client: Connected AlpacaClient instance.
-            dry_run: If True, log intended actions without submitting real orders.
+            alpaca_client: Connected ``AlpacaClient`` with a trading SDK handle.
+            dry_run: When ``True``, skip broker submission but still return synthetic ids where useful.
         """
         self.client = alpaca_client
         self.dry_run = dry_run
         self._open_orders: dict = {}
 
     def _gen_trade_id(self, symbol: str) -> str:
-        """Generate a short unique trade identifier linking signal to fill."""
+        """Return ``{symbol}-{uuid8}`` for idempotent client order ids."""
         return f"{symbol}-{uuid.uuid4().hex[:8]}"
 
     def submit_order(
@@ -43,9 +41,15 @@ class OrderExecutor:
         risk_decision: RiskDecision,
         retry_at_market: bool = True,
     ) -> Optional[str]:
-        """
-        Submit a LIMIT order for the given signal.
-        Returns order_id or None if dry_run / rejected.
+        """Place a limit buy/sell sized from approved risk output.
+
+        Args:
+            signal: Original intent (qty derives from modified signal when approved).
+            risk_decision: Must be approved with a non-null ``modified_signal``.
+            retry_at_market: After timeout, optionally re-send as market if unfilled.
+
+        Returns:
+            Alpaca order id, synthetic ``trade_id`` in dry-run, or ``None`` on failure/skip.
         """
         from alpaca.trading.requests import LimitOrderRequest, MarketOrderRequest
         from alpaca.trading.enums import OrderSide, TimeInForce
@@ -111,7 +115,11 @@ class OrderExecutor:
         signal: Signal,
         risk_decision: RiskDecision,
     ) -> Optional[str]:
-        """Submit entry + stop + take_profit via Alpaca OCO bracket order."""
+        """Submit a market bracket with child stop (and optional take-profit).
+
+        Returns:
+            Parent order id, dry-run ``trade_id``, or ``None`` if validation fails.
+        """
         from alpaca.trading.requests import MarketOrderRequest, TakeProfitRequest, StopLossRequest
         from alpaca.trading.enums import OrderSide, TimeInForce
 
@@ -149,7 +157,11 @@ class OrderExecutor:
             return None
 
     def modify_stop(self, symbol: str, order_id: str, new_stop: float, current_stop: float) -> bool:
-        """Only tighten stops, never widen."""
+        """Tighten a protective stop via replace; rejects moves that widen risk.
+
+        Returns:
+            ``True`` if Alpaca accepts the replace.
+        """
         if new_stop <= current_stop:
             logger.warning(f"modify_stop: new_stop ${new_stop:.2f} would widen stop — rejected")
             return False
@@ -164,10 +176,10 @@ class OrderExecutor:
             return False
 
     def cancel_order(self, order_id: str) -> bool:
-        """
-        Cancel an open order by its Alpaca order ID.
+        """Cancel by Alpaca id (no-op success in dry-run).
 
-        Returns True on success, False on error.
+        Returns:
+            ``True`` on SDK success.
         """
         if self.dry_run:
             return True
@@ -179,10 +191,10 @@ class OrderExecutor:
             return False
 
     def close_position(self, symbol: str) -> bool:
-        """
-        Close the entire open position for the given symbol.
+        """Flatten one symbol via the trading API.
 
-        Returns True on success, False on error.
+        Returns:
+            ``True`` on SDK success.
         """
         if self.dry_run:
             return True
@@ -194,10 +206,10 @@ class OrderExecutor:
             return False
 
     def close_all_positions(self) -> bool:
-        """
-        Close all open positions and cancel all pending orders.
+        """Emergency flatten: close positions and cancel working orders.
 
-        Returns True on success, False on error.
+        Returns:
+            ``True`` on SDK success.
         """
         if self.dry_run:
             return True

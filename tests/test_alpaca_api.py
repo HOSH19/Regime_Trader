@@ -1,10 +1,7 @@
-"""
-Test your Alpaca API credentials and connectivity.
-Run this first to confirm everything is set up correctly before running the bot.
+"""Live Alpaca connectivity checks; requires real ``.env`` credentials.
 
 Usage:
     python -m pytest tests/test_alpaca_api.py -v
-    # or directly:
     python tests/test_alpaca_api.py
 """
 
@@ -19,7 +16,11 @@ from core.timeutil import utc_now
 
 
 def _load_config():
-    """Load the project settings.yaml config and return it as a dict."""
+    """Load ``config/settings.yaml``.
+
+    Returns:
+        Parsed settings dict.
+    """
     import yaml
     cfg_path = os.path.join(os.path.dirname(__file__), "..", "config", "settings.yaml")
     with open(cfg_path) as f:
@@ -27,17 +28,17 @@ def _load_config():
 
 
 def _get_client():
-    """Instantiate and return a live AlpacaClient using settings from the config file."""
+    """Construct :class:`~broker.alpaca_client.AlpacaClient` from config + env."""
     from broker.alpaca_client import AlpacaClient
     config = _load_config()
     return AlpacaClient(config)
 
 
 class TestAlpacaCredentials:
-    """Live connectivity tests for the Alpaca API; require valid credentials in .env."""
+    """Integration tests hitting Alpaca paper/live per ``settings.yaml``."""
 
     def test_env_vars_present(self):
-        """Check that API keys are set in environment."""
+        """``ALPACA_*`` keys must be non-placeholder strings."""
         from dotenv import load_dotenv
         load_dotenv()
         api_key = os.getenv("ALPACA_API_KEY", "")
@@ -50,7 +51,7 @@ class TestAlpacaCredentials:
         )
 
     def test_client_connects(self):
-        """Test that AlpacaClient initializes without error."""
+        """Client construction succeeds when keys validate."""
         try:
             client = _get_client()
             assert client is not None
@@ -58,13 +59,13 @@ class TestAlpacaCredentials:
             pytest.fail(f"Client connection failed: {e}")
 
     def test_health_check(self):
-        """Verify account is active."""
+        """``health_check`` reflects account reachability."""
         client = _get_client()
         healthy = client.health_check()
         assert healthy, "Alpaca health check failed — account may be inactive or credentials wrong"
 
     def test_get_account(self):
-        """Fetch account details and verify key fields."""
+        """Account snapshot returns non-negative equity and buying power."""
         client = _get_client()
         account = client.get_account()
         assert account is not None
@@ -74,19 +75,19 @@ class TestAlpacaCredentials:
         assert buying_power >= 0
 
     def test_market_clock(self):
-        """Check if market clock API is accessible."""
+        """Clock endpoint returns an object."""
         client = _get_client()
         clock = client.get_clock()
         assert clock is not None
 
     def test_get_positions(self):
-        """Fetch current positions (may be empty for new accounts)."""
+        """Positions list is always a list (may be empty)."""
         client = _get_client()
         positions = client.get_positions()
         assert isinstance(positions, list)
 
     def test_historical_data(self):
-        """Fetch historical bars for SPY."""
+        """``MarketData.get_historical_bars`` returns recent SPY daily rows."""
         from datetime import timedelta
         from data.market_data import MarketData
         client = _get_client()
@@ -101,7 +102,7 @@ class TestAlpacaCredentials:
         assert len(bars) >= 15, f"Expected at least 15 bars, got {len(bars)}"
 
     def test_latest_quote(self):
-        """Check bid/ask spread for SPY."""
+        """Optional quote fetch; skip if feed unavailable."""
         from data.market_data import MarketData
         client = _get_client()
         md = MarketData(client)
@@ -113,7 +114,7 @@ class TestAlpacaCredentials:
             pytest.skip("Could not fetch quote (market may be closed)")
 
     def test_paper_trading_mode(self):
-        """Confirm paper trading mode is enabled (safety check)."""
+        """Safety: ``paper_trading`` should stay true unless intentionally live."""
         config = _load_config()
         assert config.get("broker", {}).get("paper_trading", True), (
             "paper_trading is set to False in settings.yaml. "

@@ -1,9 +1,7 @@
-"""
-Test Telegram bot connectivity and message formatting.
+"""Tests for :class:`~monitoring.telegram_notifier.TelegramNotifier` wiring and HTML briefing.
 
 Usage:
     python -m pytest tests/test_telegram.py -v
-    # or send a real test message:
     python tests/test_telegram.py
 """
 
@@ -17,16 +15,16 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
 class TestTelegramNotifier:
-    """Tests for TelegramNotifier initialization, enable/disable logic, and message formatting."""
+    """Credential gating, ``send`` short-circuit, and patched briefing composition."""
 
     def test_notifier_initializes(self):
-        """TelegramNotifier must instantiate without raising an exception."""
+        """Constructor does not raise."""
         from monitoring.telegram_notifier import TelegramNotifier
         tg = TelegramNotifier()
         assert tg is not None
 
     def test_disabled_when_no_credentials(self, monkeypatch):
-        """Notifier must report enabled=False when both credential environment variables are absent."""
+        """Missing env → ``enabled`` is false."""
         monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
         monkeypatch.delenv("TELEGRAM_CHAT_ID", raising=False)
         from monitoring.telegram_notifier import TelegramNotifier
@@ -34,7 +32,7 @@ class TestTelegramNotifier:
         assert not tg.enabled
 
     def test_enabled_when_credentials_present(self, monkeypatch):
-        """Notifier must report enabled=True when both credential environment variables are set."""
+        """Both env vars set → ``enabled`` is true."""
         monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123:abc")
         monkeypatch.setenv("TELEGRAM_CHAT_ID", "456")
         from monitoring.telegram_notifier import TelegramNotifier
@@ -42,7 +40,7 @@ class TestTelegramNotifier:
         assert tg.enabled
 
     def test_send_returns_false_when_disabled(self):
-        """send() must return False without error when the notifier is disabled."""
+        """No network when disabled; ``send`` returns ``False``."""
         from monitoring.telegram_notifier import TelegramNotifier
         tg = TelegramNotifier()
         if not tg.enabled:
@@ -50,7 +48,7 @@ class TestTelegramNotifier:
             assert result is False
 
     def test_briefing_message_format(self, monkeypatch):
-        """send_daily_briefing must return a bool, compose HTML, and never hit the real Telegram API."""
+        """``send_daily_briefing`` builds expected HTML sections via patched ``send``."""
         from monitoring.telegram_notifier import TelegramNotifier
 
         tg = TelegramNotifier()
@@ -88,7 +86,7 @@ class TestTelegramNotifier:
 
 
 if __name__ == "__main__":
-    """Send a real briefing via Telegram (same as production cron). Requires .env credentials."""
+    # Sends a real cron-style message; requires working ``.env`` Telegram vars.
     import run_daily
 
     run_daily.run()

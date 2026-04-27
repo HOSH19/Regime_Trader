@@ -1,4 +1,4 @@
-"""UTC clock helpers — prefer over deprecated datetime.utcnow() (Python 3.12+)."""
+"""Timezone-aware UTC helpers (avoid naive ``datetime.utcnow()``)."""
 
 from __future__ import annotations
 
@@ -7,12 +7,19 @@ from typing import Optional
 
 
 def utc_now() -> datetime:
-    """Current time in UTC (timezone-aware)."""
+    """Return ``datetime.now(timezone.utc)``."""
     return datetime.now(timezone.utc)
 
 
 def ensure_utc(dt: Optional[datetime]) -> Optional[datetime]:
-    """Interpret naive datetimes as UTC; normalize others to UTC."""
+    """Treat naive ``dt`` as UTC; convert aware values to UTC.
+
+    Args:
+        dt: Input timestamp or ``None``.
+
+    Returns:
+        UTC-normalized datetime, or ``None`` if ``dt`` is ``None``.
+    """
     if dt is None:
         return None
     if dt.tzinfo is None:

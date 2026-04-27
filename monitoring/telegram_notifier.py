@@ -1,14 +1,6 @@
-"""
-Telegram daily briefing and alert notifications.
+"""HTML Telegram notifications for briefings, summaries, and trade chatter.
 
-Setup:
-  1. Message @BotFather on Telegram → /newbot → copy the token
-  2. Start a chat with your bot, then visit:
-     https://api.telegram.org/bot<TOKEN>/getUpdates
-     to find your chat_id
-  3. Add to .env:
-     TELEGRAM_BOT_TOKEN=your_token_here
-     TELEGRAM_CHAT_ID=your_chat_id_here
+Configure ``TELEGRAM_BOT_TOKEN`` and ``TELEGRAM_CHAT_ID`` in the environment.
 """
 
 import logging
@@ -55,10 +47,10 @@ def _format_news_section(news: dict) -> list:
 
 
 class TelegramNotifier:
-    """Sends Telegram messages for daily briefings, market summaries, and trade alerts."""
+    """Thin ``requests`` wrapper around Telegram Bot API ``sendMessage``."""
 
-    def __init__(self):
-        """Initialize the notifier, reading credentials from environment variables."""
+    def __init__(self) -> None:
+        """Read token/chat id from env and set ``enabled`` when both are present."""
         token = os.getenv("TELEGRAM_BOT_TOKEN", "") or ""
         chat_id = os.getenv("TELEGRAM_CHAT_ID", "") or ""
         self.token = token.strip()
@@ -66,9 +58,10 @@ class TelegramNotifier:
         self.enabled = bool(self.token and self.chat_id)
 
     def send(self, message: str) -> bool:
-        """Send an HTML-formatted message to the configured Telegram chat.
+        """POST ``message`` with ``parse_mode=HTML``.
 
-        Returns True on success, False if disabled or on any delivery failure.
+        Returns:
+            ``True`` on HTTP 200 from Telegram.
         """
         if not self.enabled:
             return False
@@ -108,11 +101,10 @@ class TelegramNotifier:
         news: Optional[dict] = None,
         error: Optional[str] = None,
     ) -> bool:
-        """Compose and send the end-of-day trading briefing message.
+        """Build the multi-section EOD briefing (regime, P&L, signals, news).
 
-        Includes regime state, portfolio P&L, today's signals, orders placed,
-        open positions, top news headlines, and any error encountered.
-        Returns True if the message was delivered successfully.
+        Returns:
+            Result of the final :meth:`send` call.
         """
         mode_tag = "📄 PAPER" if paper_trading else "💵 LIVE"
         regime_emoji = {
@@ -195,9 +187,10 @@ class TelegramNotifier:
         hmm_stale_max_days: int = 3,
         news: Optional[dict] = None,
     ) -> bool:
-        """Send a market-closed summary with regime state, portfolio snapshot, and price data.
+        """Weekend / post-close style summary with regime, book, quotes, and optional news.
 
-        Used on non-trading days or when the market is closed. Returns True on success.
+        Returns:
+            Boolean from :meth:`send` after joining all sections.
         """
         mode_tag = "📄 PAPER" if paper_trading else "💵 LIVE"
         regime_emoji = {
@@ -271,11 +264,14 @@ class TelegramNotifier:
         return self.send("\n".join(lines))
 
     def send_alert(self, event: str, detail: str) -> bool:
-        """Send a critical-event alert message with an appropriate emoji prefix.
+        """Prefix ``detail`` with an emoji chosen from ``event`` and :meth:`send`.
 
         Args:
-            event: One of 'circuit_breaker', 'regime_change', 'large_pnl', 'error', 'halted'.
-            detail: Human-readable description of the event.
+            event: Logical alert name (``circuit_breaker``, ``regime_change``, etc.).
+            detail: Body text shown after the emoji.
+
+        Returns:
+            Boolean from :meth:`send`.
         """
         emoji_map = {
             "circuit_breaker": "🚨",

@@ -1,10 +1,4 @@
-"""
-Terminal-based live dashboard using the rich library.
-Refreshes every 5 seconds. Color-coded risk status bars.
-
-Layout:
-  REGIME | PORTFOLIO | POSITIONS | RECENT SIGNALS | RISK STATUS | SYSTEM
-"""
+"""Rich-powered TUI panels for regime, book, signals, and risk (optional dev UX)."""
 
 import logging
 import os
@@ -17,13 +11,13 @@ logger = logging.getLogger(__name__)
 
 
 class Dashboard:
-    """Terminal-based live dashboard rendered with the rich library."""
+    """Throttle refreshes and render multi-panel status via Rich."""
 
-    def __init__(self, config: dict):
-        """Initialize the dashboard with configuration and empty signal history.
+    def __init__(self, config: dict) -> None:
+        """Read refresh cadence from ``monitoring.dashboard_refresh_seconds``.
 
         Args:
-            config: Full application config dict; reads monitoring.dashboard_refresh_seconds.
+            config: Full settings blob.
         """
         self.cfg = config
         self.refresh_secs = config.get("monitoring", {}).get("dashboard_refresh_seconds", 5)
@@ -33,8 +27,8 @@ class Dashboard:
         self._api_latency_ms: float = 0.0
         self._hmm_training_date: Optional[datetime] = None
 
-    def refresh(self, portfolio, regime_state, hmm, signals: list):
-        """Refresh the dashboard if the configured interval has elapsed.
+    def refresh(self, portfolio, regime_state, hmm, signals: list) -> None:
+        """Maybe redraw panels when ``refresh_secs`` elapsed.
 
         Appends new signals to the recent-signals history, updates the HMM training
         date, and delegates rendering to _render. No-ops if called too soon.

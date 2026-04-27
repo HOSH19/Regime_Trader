@@ -1,6 +1,4 @@
-"""
-Performance metrics and benchmark comparisons for backtest results.
-"""
+"""Risk/return statistics, benchmarks, and Rich reporting for :class:`~backtest.result.BacktestResult`."""
 
 import logging
 from typing import Dict, List, Optional
@@ -8,7 +6,7 @@ from typing import Dict, List, Optional
 import numpy as np
 import pandas as pd
 
-from backtest.backtester import BacktestResult, Trade
+from backtest import BacktestResult, Trade
 
 logger = logging.getLogger(__name__)
 
@@ -22,7 +20,11 @@ def _annualized_return(equity: pd.Series) -> float:
 
 
 def _max_drawdown(equity: pd.Series) -> tuple:
-    """Returns (max_dd_pct, max_dd_duration_days)."""
+    """Largest peak-to-trough drawdown and longest underwater streak in bars.
+
+    Returns:
+        ``(max_dd_fraction, max_underwater_bars)``.
+    """
     peak = equity.expanding().max()
     dd = (equity - peak) / peak
     max_dd = float(dd.min())
