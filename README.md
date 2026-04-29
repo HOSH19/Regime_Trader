@@ -219,7 +219,7 @@ A validation pipeline that every signal passes through before reaching the broke
 
 Position size is derived from the stop distance:
 
-$$\text{shares} = \frac{\text{equity} \times \text{max\_risk\_per\_trade}}{\text{entry} - \text{stop\_loss}}$$
+$$\text{shares} = \frac{\text{equity} \times \text{max risk per trade}}{\text{entry} - \text{stop loss}}$$
 
 A `gap_risk_multiplier` (3×) is applied to the stop distance for overnight positions — the assumption is that a gap-through could move 3× the stop distance before the position can be closed. This prevents overfitting position size to a tight stop that won't protect against gap risk.
 
@@ -253,7 +253,7 @@ Every open position has a hard stop placed as a **GTC (Good Till Cancelled) Stop
 
 The stop price is set using **Average True Range (ATR)**:
 
-$$\text{stop} = \text{price} - (\text{ATR\_multiplier} \times \text{ATR}_{14})$$
+$$\text{stop} = \text{price} - (\text{ATR multiplier} \times \text{ATR}_{14})$$
 
 ATR measures the typical daily range including gaps, so the stop is wide enough to avoid being triggered by normal volatility while still protecting against meaningful adverse moves.
 
