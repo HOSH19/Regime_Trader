@@ -98,7 +98,7 @@ Markets don't transition smoothly — they snap between distinct states (low-vol
 
 The number of hidden states isn't fixed. The engine fits HMMs with 3, 4, 5, 6, and 7 states and selects the one with the lowest **Bayesian Information Criterion (BIC)**. BIC penalizes model complexity, preventing overfitting to the training data.
 
-> BIC = −2 · log-likelihood + k · ln(n)
+$$\text{BIC} = -2 \cdot \ell + k \cdot \ln(n)$$
 
 where k is the number of free parameters and n is the number of observations. Each candidate is fit with multiple random restarts and the best log-likelihood per candidate is used.
 
@@ -108,11 +108,11 @@ Standard Gaussian HMMs underweight crash events — a −10% day sits in the ext
 
 The Student-t is derived via a Gaussian scale-mixture:
 
-> Student-t(ν) = ∫ Gaussian(x | μ, Σ/τ) · Gamma(τ | ν/2, ν/2) dτ
+$$\text{Student-t}(\nu) = \int \mathcal{N}(x \mid \mu,\, \Sigma/\tau) \cdot \text{Gamma}(\tau \mid \nu/2,\, \nu/2)\, d\tau$$
 
 Each observation gets a per-state auxiliary weight:
 
-> E[τ_{t,k}] = (ν + d) / (ν + δ_{t,k})
+$$\mathbb{E}[\tau_{t,k}] = \frac{\nu + d}{\nu + \delta_{t,k}}$$
 
 where δ is the squared Mahalanobis distance of observation t from state k's mean. A crash observation has high δ, so τ is low — it gets **downweighted in the covariance M-step**. This means the model doesn't distort its understanding of normal regimes just because a few extreme observations occurred. With ν=4 (the default), tail thickness matches empirical equity return distributions.
 
@@ -184,7 +184,7 @@ Before applying any hard risk caps, the system computes a **Kelly-optimal positi
 
 The Kelly Criterion maximizes long-run geometric growth rate:
 
-> f* = (p · b − q) / b
+$$f^* = \frac{p \cdot b - q}{b}$$
 
 where p is win rate, q = 1 − p, and b is the payoff ratio (avg win / avg loss). Full Kelly is aggressive and sensitive to estimation error, so the system uses **half-Kelly** (f = 0.5 · f*). With conservative default priors (win rate 0.52, payoff ratio 1.5), the starting Kelly fraction is modest until historical trade data accumulates.
 
@@ -219,7 +219,7 @@ A validation pipeline that every signal passes through before reaching the broke
 
 Position size is derived from the stop distance:
 
-> shares = (equity × max_risk_per_trade) / (entry − stop_loss)
+$$\text{shares} = \frac{\text{equity} \times \text{max\_risk\_per\_trade}}{\text{entry} - \text{stop\_loss}}$$
 
 A `gap_risk_multiplier` (3×) is applied to the stop distance for overnight positions — the assumption is that a gap-through could move 3× the stop distance before the position can be closed. This prevents overfitting position size to a tight stop that won't protect against gap risk.
 
@@ -253,7 +253,7 @@ Every open position has a hard stop placed as a **GTC (Good Till Cancelled) Stop
 
 The stop price is set using **Average True Range (ATR)**:
 
-> stop = current_price − (ATR_multiplier × ATR_14)
+$$\text{stop} = \text{price} - (\text{ATR\_multiplier} \times \text{ATR}_{14})$$
 
 ATR measures the typical daily range including gaps, so the stop is wide enough to avoid being triggered by normal volatility while still protecting against meaningful adverse moves.
 
