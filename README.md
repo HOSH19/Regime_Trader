@@ -6,45 +6,21 @@ Automated US-equity algorithmic trading system built on a Hidden Markov Model re
 
 ## Signal Flow
 
-```
-OHLCV + Macro Data
-        │
-        ▼
-  Feature Engineering  ←── rolling z-score normalization
-        │
-        ▼
-  HMM Regime Detection ←── BIC model selection + Student-t emissions
-        │
-  Stability Filter     ←── debounce + flicker guard
-        │
-        ▼
-  Regime State  (label · probability · confirmation)
-        │
-        ├──────────────────────────────┐
-        ▼                              ▼
-  Strategy Selection           Technical Signal Filter
-  (vol-tier mapping)           (RSI · MACD · Bollinger)
-        │                              │
-        └──────────────┬───────────────┘
-                       ▼
-               Signal  (direction · target size)
-                       │
-                       ▼
-              Kelly Criterion Sizer
-              + Correlation Check
-                       │
-                       ▼
-               Risk Manager
-         (circuit breaker · exposure caps · guards)
-                       │
-                       ▼
-              Order Executor  (Alpaca limit → market retry)
-                       │
-                       ▼
-              ATR Trailing Stop  (live GTC order on Alpaca)
-                       │
-                       ▼
-              SQLite State Store  (equity · regime · trade log)
+```mermaid
+flowchart TD
+    A[OHLCV + Macro Data] --> B[Feature Engineering\nrolling z-score normalization]
+    B --> C[HMM Regime Detection\nBIC model selection + Student-t emissions]
+    C --> D[Stability Filter\ndebounce + flicker guard]
+    D --> E[Regime State\nlabel · probability · confirmation]
+    E --> F[Strategy Selection\nvol-tier mapping]
+    E --> G[Technical Signal Filter\nRSI · MACD · Bollinger]
+    F --> H[Signal\ndirection · target size]
+    G --> H
+    H --> I[Kelly Criterion Sizer\n+ Correlation Check]
+    I --> J[Risk Manager\ncircuit breaker · exposure caps · guards]
+    J --> K[Order Executor\nAlpaca limit → market retry]
+    K --> L[ATR Trailing Stop\nlive GTC order on Alpaca]
+    L --> M[SQLite State Store\nequity · regime · trade log]
 ```
 
 ---
