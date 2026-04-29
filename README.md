@@ -1,250 +1,335 @@
 # HMM Algo Trader
 
-Automated US-equity algorithmic trading system. A Hidden Markov Model classifies the market into volatility-ordered regimes; a multi-layer strategy stack maps those regimes to target long exposure, confirmed by technical indicators, sized by Kelly Criterion, and protected by ATR-based trailing stops.
-
-The HMM is a **volatility / environment classifier**, not a return forecaster. The system is **long-only**.
+Automated US-equity algorithmic trading system built on a Hidden Markov Model regime classifier. The system is fully systematic and long-only — every decision from signal to order size to stop placement is rules-based with no discretion.
 
 ---
 
-## Architecture
+## Signal Flow
 
 ```
-Market Data
-    │
-    ▼
-Feature Engineering ──► HMM Regime Detection
-                              │
-                        Stability Filter
-                              │
-                        Regime State (label + probability)
-                              │
-                    ┌─────────┴──────────┐
-                    ▼                    ▼
-           Technical Signal       Strategy Selection
-             Filter                (vol-tier mapping)
-           (RSI/MACD/BB)               │
-                    └─────────┬──────────┘
-                              ▼
-                        Signal (direction + size)
-                              │
-                        Kelly Sizer + Risk Manager
-                              │
-                        Order Executor (Alpaca)
-                              │
-                        ATR Stop Manager (GTC orders)
+OHLCV + Macro Data
+        │
+        ▼
+  Feature Engineering  ←── rolling z-score normalization
+        │
+        ▼
+  HMM Regime Detection ←── BIC model selection + Student-t emissions
+        │
+  Stability Filter     ←── debounce + flicker guard
+        │
+        ▼
+  Regime State  (label · probability · confirmation)
+        │
+        ├──────────────────────────────┐
+        ▼                              ▼
+  Strategy Selection           Technical Signal Filter
+  (vol-tier mapping)           (RSI · MACD · Bollinger)
+        │                              │
+        └──────────────┬───────────────┘
+                       ▼
+               Signal  (direction · target size)
+                       │
+                       ▼
+              Kelly Criterion Sizer
+              + Correlation Check
+                       │
+                       ▼
+               Risk Manager
+         (circuit breaker · exposure caps · guards)
+                       │
+                       ▼
+              Order Executor  (Alpaca limit → market retry)
+                       │
+                       ▼
+              ATR Trailing Stop  (live GTC order on Alpaca)
+                       │
+                       ▼
+              SQLite State Store  (equity · regime · trade log)
 ```
 
 ---
 
-## Modules
+## 1 — Feature Engineering
 
-### `data/`
+Every feature is computed from OHLCV data using only information available **at or before** each bar, then passed through a **252-day rolling z-score**. The z-score means the HMM sees comparable scales across all market environments and calendar periods — a spike in volatility in 2020 and a quiet 2017 look numerically comparable to the model.
 
-| File | Class / Function | Responsibility |
-|------|-----------------|----------------|
-| `market_data.py` | `MarketData` | Thin facade — composes fetcher and stream |
-| `historical_fetcher.py` | `HistoricalFetcher` | OHLCV download, gap repair, snapshots |
-| `stream_manager.py` | `StreamManager` | Alpaca WebSocket bar stream, daemon thread |
-| `feature_engineering.py` | `get_feature_matrix()` | Price-derived + macro features, z-scored |
-| `macro_fetcher.py` | `fetch_macro_df()` | VIX, yield curve, credit proxy via yfinance |
+**Price features**
 
-### `core/hmm/`
+| Feature | What it captures |
+|---------|----------------|
+| `ret_1`, `ret_5`, `ret_20` | Momentum across short, medium, and longer horizons |
+| `realized_vol` | 20-day rolling std of log returns — the core regime signal |
+| `vol_ratio` | Short (5d) vol / long (20d) vol — catches vol regime transitions before they're obvious |
+| `roc_10`, `roc_20` | Rate of change — trend persistence |
+| `dist_sma200` | Fractional distance from the 200-day SMA — bear/bull structural position |
+| `sma50_slope` | Derivative of the 50-day SMA — trend direction at medium scale |
+| `adx` | Average Directional Index — measures trend strength independent of direction |
+| `rsi_zscore` | RSI(14) expressed as a z-score — momentum normalized to its own history |
+| `norm_atr` | ATR(14) / close — volatility as a fraction of price, comparable across time |
 
-| File | Class / Function | Responsibility |
-|------|-----------------|----------------|
-| `engine.py` | `HMMEngine` | Coordinator — trains, infers, persists |
-| `model_selector.py` | `ModelSelector` | BIC selection across candidate state counts |
-| `stability_filter.py` | `StabilityFilter` | Debounce regime switches, track flicker rate |
-| `regime_metadata.py` | `build_regime_infos()` | Extract return/vol stats from Viterbi paths |
-| `forward_algorithm.py` | `forward_pass()` | Normalized forward recursion (no look-ahead) |
-| `persistence.py` | `save()` / `load()` | Pickle serialization for model checkpoint |
-| `gaussian_model.py` | `GaussianHMMModel` | Gaussian emission wrapper over hmmlearn |
-| `student_t_model.py` | `StudentTHMMModel` | Student-t emission with custom EM |
+**Volume features**
 
-### `core/signals/`
+| Feature | What it captures |
+|---------|----------------|
+| `vol_norm` | Volume z-scored vs its 50-day history — unusual participation |
+| `vol_trend` | First difference of 10-day volume SMA — whether participation is growing or shrinking |
 
-| File | Class / Function | Responsibility |
-|------|-----------------|----------------|
-| `indicators.py` | `rsi()`, `macd()`, `bollinger()`, `atr()` | Pure vectorized indicator functions |
-| `technical_filter.py` | `TechnicalSignalFilter` | Gate and scale signals by regime tier |
+**Macro features** (when `use_macro_features: true`)
 
-### `core/strategies/`
+| Feature | Source | What it captures |
+|---------|--------|----------------|
+| `macro_vix` | VIX index | Market-implied fear — the single best real-time regime signal |
+| `macro_yield_spread` | 10Y minus 3-month Treasury | Yield curve steepness; inversion has preceded every US recession since 1955 |
+| `macro_credit_proxy` | HYG minus LQD log-return diff | Credit stress, duration-neutral — detects risk-off before equities reprice |
 
-| File | Class | Responsibility |
-|------|-------|----------------|
-| `orchestrator.py` | `StrategyOrchestrator` | Route regime to strategy, apply technical confirmation |
-| `low_vol_bull.py` | `LowVolBullStrategy` | High allocation, elevated leverage |
-| `mid_vol_cautious.py` | `MidVolCautiousStrategy` | Allocation scales with trend |
-| `high_vol_defensive.py` | `HighVolDefensiveStrategy` | Reduced allocation, 1.0× leverage |
-
-### `core/risk/`
-
-| File | Class | Responsibility |
-|------|-------|----------------|
-| `risk_manager.py` | `RiskManager` | Pipeline: circuit breakers → Kelly sizing → exposure caps |
-| `kelly_sizer.py` | `KellySizer` | Half-Kelly with correlation-aware reduce/reject |
-| `stop_manager.py` | `StopManager` | ATR trailing stops as live GTC orders on Alpaca |
-| `circuit_breaker.py` | `CircuitBreaker` | Intraday / weekly / peak drawdown gates |
-
-### `monitoring/`
-
-| File | Class / Function | Responsibility |
-|------|-----------------|----------------|
-| `telegram_notifier.py` | `TelegramNotifier` | Thin HTTP sender to Telegram Bot API |
-| `messages.py` | `daily_briefing_message()`, `market_summary_message()` | Pure HTML message builders |
-| `dashboard.py` | `Dashboard` | Rich TUI — refresh throttle and render coordination |
-| `panels.py` | `regime_panel()`, `portfolio_panel()`, … | Pure Rich panel builder functions |
-| `alerts.py` | `AlertManager` | Rate-limited alerts (webhook / email) |
-| `state_store.py` | `StateStore` | SQLite: snapshot, equity curve, regime history, trade log |
-| `logger.py` | `setup_structured_logging()` | JSON rotating log handler |
-
-### `backtest/`
-
-| File | Class | Responsibility |
-|------|-------|----------------|
-| `walk_forward_backtester.py` | `WalkForwardBacktester` | Rolling IS train → OOS simulation |
-| `stress_test.py` | — | Crash injection, gap risk, regime misclassification |
-| `performance.py` | — | Sharpe, Calmar, drawdown, attribution report |
+Macro fetches are non-fatal — if the data source is unavailable the engine trains on price features only.
 
 ---
 
-## Feature Engineering
+## 2 — HMM Regime Detection
 
-All features are built from OHLCV in `data/feature_engineering.py` using only information available **at or before** each bar. Every column is passed through a **252-day rolling z-score**.
+The core of the system. A **Hidden Markov Model** treats market regimes as a latent (unobservable) variable and infers the current regime from the observable feature sequence.
 
-| Feature | Construction |
-|---------|-------------|
-| `ret_1`, `ret_5`, `ret_20` | Log returns over 1, 5, 20 days |
-| `realized_vol` | 20-day rolling std of daily log returns |
-| `vol_ratio` | Short (5d) vs long (20d) realized vol ratio |
-| `vol_norm` | Volume z-score vs 50-day rolling mean/std |
-| `vol_trend` | First difference of 10-day volume SMA |
-| `adx` | 14-period ADX (trend strength) |
-| `sma50_slope` | One-day change in 50-day SMA of close |
-| `rsi_zscore` | RSI(14) as a rolling z-score |
-| `dist_sma200` | Fractional distance of close from 200-day SMA |
-| `roc_10`, `roc_20` | Rate of change over 10 and 20 days |
-| `norm_atr` | ATR(14) / close |
+**Why an HMM?**
 
-**Macro features** (when `use_macro_features: true`):
+Markets don't transition smoothly — they snap between distinct states (low-vol bull, high-vol bear, crash) that persist for weeks to months. An HMM explicitly models this persistence via a transition matrix where the diagonal (self-transition probability) is high. This is more appropriate than a threshold-based rule because the model learns the statistical properties of each regime from data rather than having them hard-coded.
 
-| Feature | Source | Captures |
-|---------|--------|---------|
-| `macro_vix` | `^VIX` | Market fear / implied vol |
-| `macro_yield_spread` | `^TNX − ^IRX` | Yield curve steepness |
-| `macro_credit_proxy` | `HYG − LQD` log-return diff | Credit stress |
+**BIC model selection**
 
----
+The number of hidden states isn't fixed. The engine fits HMMs with 3, 4, 5, 6, and 7 states and selects the one with the lowest **Bayesian Information Criterion (BIC)**. BIC penalizes model complexity, preventing overfitting to the training data.
 
-## HMM Regime Detection
+> BIC = −2 · log-likelihood + k · ln(n)
 
-**Emission models** — selectable via `emission_type` in config:
+where k is the number of free parameters and n is the number of observations. Each candidate is fit with multiple random restarts and the best log-likelihood per candidate is used.
 
-- **Gaussian** — standard multivariate Gaussian HMM via hmmlearn.
-- **Student-t** — custom EM using the Gaussian scale-mixture representation:
+**Student-t emissions**
 
-  > Student-t(ν) = ∫ Gaussian(x | μ, Σ/τ) · Gamma(τ | ν/2, ν/2) dτ
+Standard Gaussian HMMs underweight crash events — a −10% day sits in the extreme tail and barely influences regime assignment. Financial returns have **fat tails** (excess kurtosis), so the system uses a **Student-t emission model** by default.
 
-  Each observation gets a per-state auxiliary weight E[τ_{t,k}] = (ν + d) / (ν + δ_{t,k}). Outliers (high Mahalanobis distance δ) receive lower weight, shrinking their influence on the covariance M-step. With ν=4, tails match empirical equity returns.
+The Student-t is derived via a Gaussian scale-mixture:
 
-**Model selection** — `ModelSelector` fits each candidate state count (3–7) with multiple random restarts and picks the lowest BIC.
+> Student-t(ν) = ∫ Gaussian(x | μ, Σ/τ) · Gamma(τ | ν/2, ν/2) dτ
 
-**Live inference** — `forward_pass()` runs the normalized forward recursion only. Viterbi is never used on the streaming boundary to prevent look-ahead bias.
+Each observation gets a per-state auxiliary weight:
 
-**Stability filter** — `StabilityFilter` requires a new state to persist for `stability_bars` consecutive bars before the confirmed regime flips. Confirmed switches within `flicker_window` are counted; exceeding `flicker_threshold` halves position sizes.
+> E[τ_{t,k}] = (ν + d) / (ν + δ_{t,k})
 
-**Labels** — at training time, Viterbi assigns each state a return-ranked human label (BEAR → STRONG\_BEAR → … → BULL → STRONG\_BULL → EUPHORIA). Volatility rank selects a strategy tier.
+where δ is the squared Mahalanobis distance of observation t from state k's mean. A crash observation has high δ, so τ is low — it gets **downweighted in the covariance M-step**. This means the model doesn't distort its understanding of normal regimes just because a few extreme observations occurred. With ν=4 (the default), tail thickness matches empirical equity return distributions.
 
----
+**Forward algorithm — no look-ahead bias**
 
-## Technical Signal Layer
+Live regime inference uses the **normalized forward algorithm** only. The forward algorithm computes the probability of the observed sequence up to time t for each state, then normalizes. Critically, it never looks at future bars. **Viterbi decoding is never used in live inference** — Viterbi is a smoothing algorithm that uses the full sequence to label each bar, which would constitute look-ahead bias on the streaming boundary.
 
-`TechnicalSignalFilter` adds a second confirmation gate after the HMM regime, applied per-symbol inside `StrategyOrchestrator`:
+Viterbi is used only at training time to assign human-readable labels to states.
 
-| Regime tier | Signal type | Indicators used |
-|------------|-------------|----------------|
-| Low-vol / bull | Momentum | RSI(14) in [50, 75] AND MACD histogram positive and growing |
-| Mid-vol / neutral | Mean-reversion | Price at or below Bollinger Band (20, 2σ) midline |
-| High-vol / defensive | None | Pass-through — position is already defensive |
+**Regime labels**
 
-Confirmation returns a `strength` float in [0, 1] that directly scales the signal's `position_size_pct`. A failed confirmation drops the signal entirely (size = 0).
+After training, each state is assigned a human label by sorting states on their expected return (derived from Viterbi paths on training data). With 5 states the labels are BEAR → WEAK\_BEAR → NEUTRAL → WEAK\_BULL → BULL. With 3 states: BEAR → NEUTRAL → BULL. Volatility rank per state selects the strategy tier.
+
+**Stability filter**
+
+The raw HMM argmax flips bar-to-bar even within a confirmed regime as probabilities fluctuate. The stability filter requires a new state to persist for `stability_bars` consecutive bars before the confirmed regime changes. This prevents unnecessary rebalancing on transient probability shifts.
+
+**Flicker guard**
+
+Even with the stability filter, a choppy market can produce rapid regime switches. Confirmed switches within the last `flicker_window` bars are counted. If the count exceeds `flicker_threshold`, all position sizes are halved via `uncertainty_size_mult`. The system is still trading — just with appropriate humility about regime certainty.
 
 ---
 
-## Risk Layer
+## 3 — Strategy Selection
 
-### Kelly Criterion sizing
+Each HMM state maps to one of three strategy tiers by volatility rank (calmest state → LowVolBull, most volatile → HighVolDefensive). Volatility rank is computed at training time from mean ATR-normalized volatility within each state.
 
-`KellySizer` applies **half-Kelly** (0.5f) before existing risk caps:
+| Tier | Regime character | Target allocation | Leverage |
+|------|-----------------|-------------------|----------|
+| LowVolBull | Low vol, positive drift | 95% of equity | 1.25× |
+| MidVolCautious | Mid vol, trend-dependent | 60–95% of equity | 1.0× |
+| HighVolDefensive | High vol, negative drift | 60% of equity | 1.0× |
 
-- Default priors: win\_rate = 0.52, payoff\_ratio = 1.5 (conservative until backtest data is available).
-- **Correlation cap:** computes 20-day return correlation against all existing positions.
-  - ≥ `correlation_reduce_threshold` (0.70): size multiplied by (1 − correlation).
-  - ≥ `correlation_reject_threshold` (0.85): signal rejected entirely.
+A **rebalance deadband** suppresses signals when the current allocation is already within `rebalance_threshold` (10%) of the target. This avoids trading costs from minor drift.
 
-### Circuit breaker
+When regime probability is below `min_confidence` (0.55) or flicker is detected, position sizes are halved regardless of tier.
 
-`CircuitBreaker` enforces four independent gates:
+---
+
+## 4 — Technical Signal Filter
+
+The HMM answers *what environment are we in* — it does not answer *is this a good entry right now*. The technical filter adds a second confirmation gate that checks momentum or mean-reversion conditions per-symbol.
+
+The regime tier determines which signal type is appropriate:
+
+**Momentum confirmation** (low-vol / bull regimes)
+
+- RSI(14) in [50, 75] — above 50 means recent gains outpace losses; above 75 risks being overbought
+- MACD histogram positive and increasing — the fast EMA is accelerating away from the slow EMA
+
+Both conditions give full size. Either condition alone gives 60% size. Neither blocks the signal.
+
+**Mean-reversion confirmation** (mid-vol / neutral regimes)
+
+- Price at or below the lower Bollinger Band (20-period, 2σ) — statistically extended on the downside
+- Price below the midline (20-day SMA) — moderate extension
+
+The Bollinger Band is a volatility envelope: when price reaches the lower band, it has moved more than 2 standard deviations from its recent mean. Mean-reversion assumes this is a temporary dislocation.
+
+**High-vol / defensive regimes** — no technical gate; the strategy is already defensive and the priority is capital preservation over entry timing.
+
+Confirmation returns a `strength` scalar in [0, 1] that directly scales `position_size_pct`. A failed confirmation drops the signal entirely.
+
+---
+
+## 5 — Kelly Criterion Sizing
+
+Before applying any hard risk caps, the system computes a **Kelly-optimal position fraction** for each signal.
+
+The Kelly Criterion maximizes long-run geometric growth rate:
+
+> f* = (p · b − q) / b
+
+where p is win rate, q = 1 − p, and b is the payoff ratio (avg win / avg loss). Full Kelly is aggressive and sensitive to estimation error, so the system uses **half-Kelly** (f = 0.5 · f*). With conservative default priors (win rate 0.52, payoff ratio 1.5), the starting Kelly fraction is modest until historical trade data accumulates.
+
+**Correlation-aware sizing**
+
+Adding a correlated position to an existing book doesn't reduce portfolio risk proportionally. The sizer computes the 20-day return correlation between the incoming symbol and every existing position:
+
+- Correlation ≥ 0.70 — position size is multiplied by (1 − correlation), reducing concentration
+- Correlation ≥ 0.85 — signal is rejected entirely; the position would be nearly redundant with an existing holding
+
+The Kelly fraction is then further capped by the hard `max_single_position` (15%) limit.
+
+---
+
+## 6 — Risk Manager
+
+A validation pipeline that every signal passes through before reaching the broker. Each check is independent — failing any one rejects or modifies the signal.
+
+| Check | What it enforces |
+|-------|-----------------|
+| Circuit breaker state | Hard stop if daily/weekly/peak drawdown gates are breached |
+| Circuit breaker reduction | Halve size on soft drawdown thresholds |
+| Stop-loss present | Reject any signal missing a positive stop-loss |
+| Daily trade cap | Reject when `max_daily_trades` is reached for the session |
+| Duplicate symbol | Reject the same symbol traded within `duplicate_block_seconds` |
+| Max concurrent positions | Reject when already holding `max_concurrent` names |
+| Per-trade risk budget | Size down using risk-per-share and gap-risk multiplier |
+| Gross exposure | Reject if adding this position would exceed `max_exposure` of equity |
+| Leverage cap | Force leverage to 1.0× if circuit breaker is active or 3+ positions are held |
+
+**Per-trade risk budget**
+
+Position size is derived from the stop distance:
+
+> shares = (equity × max_risk_per_trade) / (entry − stop_loss)
+
+A `gap_risk_multiplier` (3×) is applied to the stop distance for overnight positions — the assumption is that a gap-through could move 3× the stop distance before the position can be closed. This prevents overfitting position size to a tight stop that won't protect against gap risk.
+
+**Circuit breaker**
+
+Five drawdown gates run in priority order. Once a hard halt is triggered, a lock file is written to disk — trading cannot resume until the file is manually deleted. This prevents the system from re-entering after a catastrophic drawdown during a process restart.
 
 | Gate | Threshold | Action |
 |------|-----------|--------|
-| Daily drawdown soft | 2% | Reduce size 50% |
-| Daily drawdown hard | 3% | Close all + halt |
-| Weekly drawdown soft | 5% | Reduce size 50% |
-| Weekly drawdown hard | 7% | Close all + halt |
-| Peak drawdown | 10% | Halt + write lock file |
-
-### ATR trailing stops
-
-`StopManager` places a **live GTC StopOrder on Alpaca** for every open position so the stop survives process restarts:
-
-- ATR multiplier varies by regime vol tier: 1.5× (low), 2.0× (mid), 3.0× (high).
-- On each bar, if the new ATR stop is higher than the current stop, the order is replaced (trailing tighter). The stop never widens.
+| Daily drawdown | −2% | Reduce all sizes 50% |
+| Daily drawdown | −3% | Close all positions, halt for the day |
+| Weekly drawdown | −5% | Reduce all sizes 50% |
+| Weekly drawdown | −7% | Close all positions, halt for the week |
+| Drawdown from peak | −10% | Close all, write lock file, require manual restart |
 
 ---
 
-## State Persistence
+## 7 — Order Execution
 
-`StateStore` (`monitoring/state_store.py`) replaces the flat `state_snapshot.json` with a **SQLite database** (`state.db`, WAL mode):
+Orders are submitted as **limit orders** with a small offset above the ask (0.1%) to maximize fill probability while avoiding crossing the spread at market. If a limit order is unfilled after 30 seconds, it is cancelled and re-submitted as a market order.
+
+All orders use a `client_order_id` in the format `{symbol}-{uuid8}` for idempotency — if the process crashes between submission and confirmation, the same trade ID prevents double-fills on restart.
+
+The executor also supports **bracket orders** — a market entry with child stop-loss and optional take-profit attached. These are used when the stop must be placed atomically with the entry.
+
+---
+
+## 8 — ATR Trailing Stops
+
+Every open position has a hard stop placed as a **GTC (Good Till Cancelled) StopOrder directly on Alpaca**. Placing the stop at the broker level means it survives process crashes, network outages, and restarts — the position is protected even when the trading process is not running.
+
+The stop price is set using **Average True Range (ATR)**:
+
+> stop = current_price − (ATR_multiplier × ATR_14)
+
+ATR measures the typical daily range including gaps, so the stop is wide enough to avoid being triggered by normal volatility while still protecting against meaningful adverse moves.
+
+The multiplier varies by regime:
+
+| Regime tier | ATR multiplier | Rationale |
+|------------|---------------|-----------|
+| Low-vol / bull | 1.5× | Tighter stop — market is calm, adverse move is more signal |
+| Mid-vol / neutral | 2.0× | Standard room for noise |
+| High-vol / defensive | 3.0× | Wider stop — normal swings are large; a tight stop would whipsaw |
+
+On each bar, if the new ATR stop is **higher** than the current stop, the GTC order is replaced (trailing tighter). The stop **never widens** — this property preserves accumulated gains in a trending position.
+
+---
+
+## 9 — State Persistence
+
+All runtime state is stored in a **SQLite database** (`state.db`, WAL mode for concurrent read safety):
 
 | Table | Contents |
 |-------|---------|
-| `snapshot` | Latest equity, cash, regime, circuit-breaker status — fast restart recovery |
-| `equity_curve` | Timestamped equity + cash rows |
-| `regime_history` | Regime label, probability, confirmation flag per bar |
-| `trade_log` | Every submitted order: symbol, side, qty, price, order\_id, regime, strategy |
+| `snapshot` | Latest equity, cash, regime, circuit-breaker status — read on restart to restore position context |
+| `equity_curve` | Timestamped equity + cash — full P&L history |
+| `regime_history` | Label, probability, confirmation flag per bar — regime attribution analysis |
+| `trade_log` | Every submitted order with symbol, side, qty, fill price, regime active at time of trade, strategy tier |
+
+The trade log enables **post-trade regime attribution** — which regime was the system in when each trade was placed, and what was the subsequent P&L. This is the foundation for computing realized win rates and payoff ratios to eventually replace the Kelly prior defaults.
+
+---
+
+## Backtesting
+
+The walk-forward backtester avoids look-ahead bias by strictly separating in-sample and out-of-sample windows:
+
+1. Train HMM on the in-sample window (default 252 bars / 1 year)
+2. Simulate the out-of-sample window bar-by-bar (default 126 bars / 6 months), calling `predict_regime_filtered` with only the history up to that bar
+3. Step forward by `step_size` bars and repeat
+
+This means no future data ever influences a trade decision — the model trained on years 1–2 is used to trade year 3, then retrained on years 2–3 to trade year 4, and so on.
+
+**Slippage and fill delay** are modelled explicitly: signals on bar N fill at the next bar's open (fill\_delay = 1 bar), with a 0.05% slippage applied to the fill price.
+
+**Stress tests** run three additional scenarios on top of the base backtest:
+- **Crash injection** — random 20–40% price drops inserted at random dates
+- **Gap risk** — overnight gaps of 5–15% applied to open positions
+- **Regime misclassification** — random regime label flips to test how sensitive returns are to HMM accuracy
 
 ---
 
 ## Configuration
 
-All tunable parameters in `config/settings.yaml`:
-
 ```yaml
 hmm:
   emission_type: student_t   # gaussian | student_t
-  student_t_dof: 4
+  student_t_dof: 4           # lower = heavier tails
   use_macro_features: true
   n_candidates: [3, 4, 5, 6, 7]
-  stale_max_days: 3
+  stability_bars: 3
+  flicker_threshold: 4
+  min_confidence: 0.55
 
 technical:
-  rsi_period: 14
   rsi_bull_min: 50
   rsi_bull_max: 75
-  macd_fast: 12
-  macd_slow: 26
   bb_period: 20
   bb_std: 2.0
 
 risk:
-  max_risk_per_trade: 0.01
-  max_single_position: 0.15
+  max_risk_per_trade: 0.01       # 1% of equity per trade
+  max_single_position: 0.15      # 15% max in one name
   correlation_reduce_threshold: 0.70
   correlation_reject_threshold: 0.85
   daily_dd_halt: 0.03
   weekly_dd_halt: 0.07
   max_dd_from_peak: 0.10
+  gap_risk_multiplier: 3.0
 ```
 
 ---
@@ -252,36 +337,24 @@ risk:
 ## Running
 
 ```bash
-# Live / paper trading loop
+# Paper trading (default)
+python run_daily.py
+
+# Live trading loop (streaming bars)
 python main.py
 
-# Dry run (no orders placed)
+# Dry run — full pipeline, no orders placed
 python main.py --dry-run
-
-# Daily cron (trade if market open, else send Telegram summary)
-python run_daily.py
 
 # Walk-forward backtest
 python main.py --backtest --symbols SPY --start 2019-01-01 --end 2024-12-31
 
-# Stress tests (crash injection, gap risk, regime misclassification)
+# Backtest with stress tests
 python main.py --backtest --stress-test --symbols SPY
 
-# Train HMM and exit
+# Retrain HMM only
 python main.py --train-only
 
-# Tests
+# Run tests
 python -m pytest tests/ -v
 ```
-
----
-
-## Paper → Live Gate
-
-| Gate | Requirement |
-|------|------------|
-| Backtest | Sharpe > 0.8, max drawdown < 20% out-of-sample |
-| Paper trading | 30+ trading days, equity within 15% of backtest projection |
-| Slippage audit | Simulated vs actual fills within 0.3% per trade |
-| Circuit breaker | Manual trigger confirmed on paper |
-| Live | Switch Alpaca keys from paper to live endpoint |
